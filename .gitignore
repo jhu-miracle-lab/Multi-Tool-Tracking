@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+build/
+install/
+log/
+tracking_output_*/
+*.mp4
+models/
+models.zip
+*.zip
