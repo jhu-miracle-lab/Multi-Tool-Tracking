@@ -89,3 +89,16 @@ def draw_hud(img, fps: float, infer_ms: float):
     y = th + 12
     cv2.putText(img, text, (x, y), font, fs, (0, 0, 0), ft + 2, cv2.LINE_AA)
     cv2.putText(img, text, (x, y), font, fs, (255, 255, 255), ft, cv2.LINE_AA)
+
+
+def draw_overlap_hud(img, coverage):
+    """Draw bidirectional keypoint coverage below the performance HUD."""
+    label = "overlap: n/a" if coverage is None else f"overlap: {coverage * 100:.0f}%"
+    color = (255, 255, 255) if coverage in (None, 0.0) else (0, 0, 255)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs, ft = 0.55, 2
+    (tw, th), _ = cv2.getTextSize(label, font, fs, ft)
+    x = img.shape[1] - tw - 10
+    y = th + 40
+    cv2.putText(img, label, (x, y), font, fs, (0, 0, 0), ft + 2, cv2.LINE_AA)
+    cv2.putText(img, label, (x, y), font, fs, color, ft, cv2.LINE_AA)

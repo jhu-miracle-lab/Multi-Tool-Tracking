@@ -5,74 +5,20 @@ import os
 import cv2
 import numpy as np
 import yaml
+from scipy.spatial.transform import Rotation
 
 from core.RobotLink import RobotLink
 from core.ParticleFilter import ParticleFilter
 from core.utils import axisAngleToRotationMatrix
 
 from .constants import (
-    LIKELIHOOD_THRESH_OPT,
-    DELTA_PROCESS_STD,
-    SHAFT_EDGE_EMA_ALPHA,
-    SHAFT_USE_HOUGH,
+        DELTA_PROCESS_STD,
 )
 from .kinematics import load_kin_data
-from .label_assignment import assign_labels, LR_BASES, FB_BASES
-from .observation import pf_init, pf_motion, create_combined_obs_model_vec
+from .observation import pf_init, pf_motion, create_combined_obs_model_vec, _project_batch
+from .label_assignment import LR_BASES, FB_BASES
 from .visualization import project_skeleton, draw_keypoints
-from .canny_hough import process as _hough_process, get_roi as _hough_get_roi
-
-# Fallback Canny+HoughLines shaft-edge params, per arm -- used only when a
-# dataset doesn't have its own tuned canny_params_{arm}.json (see
-# offline_tracking.py). Schema matches tracking/canny_hough.py's process(),
-# the same detector test_canny_hough.py's interactive tuner uses, so any
-# dataset-specific tuned params drop in directly via the `shaft_params`
-# constructor arg.
-_SHAFT_CANNY_PARAMS = {
-    "psm1": {
-        "blur": 2,
-        "canny_lo": 49,
-        "canny_hi": 92,
-        "do_skel": False,
-        "hough_thr": 57,
-        "min_w": 38,
-        "max_w": 60,
-        "angle_tol": 18,
-        "temporal_tol": 29,
-        "par_tol": 4,
-        "roi_pad": 140,
-        "edge_margin": 0,
-    },
-    "psm2": {
-        "blur": 2,
-        "canny_lo": 25,
-        "canny_hi": 103,
-        "do_skel": False,
-        "hough_thr": 34,
-        "min_w": 43,
-        "max_w": 63,
-        "angle_tol": 36,
-        "temporal_tol": 15,
-        "par_tol": 5,
-        "roi_pad": 79,
-        "edge_margin": 30,
-    },
-}
-
-
-def _get_detections(source, frame_idx: int, img):
-    """Retrieve keypoint detections from either a pre-loaded dict or a DLCRunner.
-
-    Supports two source types:
-      - dict  {frame_idx: {label: (x, y, likelihood)}} — offline CSV data.
-      - DLCRunner with an .infer(img) method — realtime inference.
-    """
-    if source is None:
-        return {}
-    if hasattr(source, "infer"):
-        return source.infer(img) if img is not None else {}
-    return source.get(frame_idx, {})
-
+from .feature_detection import ArmFeatureDetector
 
 class ArmTracker:
     """Tracks a single robot arm with a delta_T particle filter.
@@ -124,7 +70,6 @@ class ArmTracker:
         self.kp_color = cfg["kp_color"]
 
         self.name2pt = {}
-        self._last_state_label = ""
 
         # Stereo projection matrices for triangulation
         P1 = projector.K1 @ np.hstack([np.eye(3), np.zeros((3, 1))])
@@ -153,40 +98,30 @@ class ArmTracker:
         self.cam_T_b_kin = self.cam_T_b.copy()
         self.b_T_cam_kin = np.linalg.inv(self.cam_T_b_kin)
 
-        self.curr_lr = "left"
-        self.curr_fb = "back"
-
-        # Shaft (cylinder) feature for the edge-likelihood term, if this arm has one.
-        self._shaft_params = (
-            shaft_params if shaft_params is not None else _SHAFT_CANNY_PARAMS.get(name)
+        self.feature_detector = ArmFeatureDetector(
+            name, dlc_left, dlc_right, shaft_params
         )
+
+        # Relative-tracking mode: when primary_tracker is set (via
+        # set_relative_to()), this arm's pose is anchored to the primary
+        # arm's live cam_T_b instead of this arm's own fixed cam_T_b_kin.
+        # See _anchor_T() / set_relative_to().
+        self.primary_tracker = None
+        self.T_rel_bar = np.eye(4)
+        self._explicit_anchor = None
+        self._last_init_std = DELTA_PROCESS_STD.copy()
+
+        # Shaft geometry is consumed by the PF; image detection lives in ArmFeatureDetector.
         shaft_pos_list, shaft_dir_list, _, shaft_radius_list = self.robot_arm.getShaftFeatures()
-        self._has_shaft = self._shaft_params is not None and len(shaft_pos_list) > 0
+        self._has_shaft = self.feature_detector.shaft_params is not None and len(shaft_pos_list) > 0
         self._shaft_pos_b = shaft_pos_list[0] if self._has_shaft else None
         self._shaft_dir_b = shaft_dir_list[0] if self._has_shaft else None
         self._shaft_radius = shaft_radius_list[0] if self._has_shaft else None
 
         # PF state = [dtx, dty, dtz, drx, dry, drz], zero = identity
         state_init = np.zeros(6)
-        self._vec_obs_func = create_combined_obs_model_vec(
-            lambda: self.cam_T_b_kin, self._shaft_radius
-        )
-
-        # Detected shaft edge segments in full-image coords (for drawing)
-        self._last_detected_segs: list = []
-        # EMA of detected Hough lines [(rho1,th1),(rho2,th2)] sorted by rho, full-image coords
-        # (drawing / detection-dropout fallback only — NOT fed to the PF likelihood)
-        self._ema_lines = None
-        # Raw (theta, rho_c) pair from THIS frame's detection, image-centre-origin Hough
-        # convention matching shaft_edge.py — fed directly into the PF likelihood, with no
-        # temporal smoothing (that's the filter's job, not the detector's).
-        self._last_raw_hough = None
-        # Last successful pair selection, full-image (rho, theta) -- used as
-        # _select_two_polar's temporal prior for the NEXT frame (position +
-        # width matching), same mechanism as test_canny_hough.py's tuner.
-        # Separate from _ema_lines (which is smoothed and used for drawing/
-        # dropout-fallback) so a bad EMA doesn't bias which pair gets picked.
-        self._prev_final_global = None
+        self._vec_obs_func = create_combined_obs_model_vec(self._anchor_T, self._shaft_radius)
+        self.observation_variance_scale = 1.0
 
         self.pf = ParticleFilter(
             num_states=6,
@@ -198,10 +133,286 @@ class ArmTracker:
         )
         self.pf.initializeFilter(mean_state=state_init, std=DELTA_PROCESS_STD)
         self.pose_state = state_init.copy()
+        self.prediction_unreliability = 0.0
+        self.prediction_reliability_details = {}
+        self.last_log_evidence = float("nan")
+
+    def _anchor_T(self):
+        """The fixed pose that pose_state's delta_T is applied on top of.
+
+        Normally this arm's own fixed hand-eye extrinsic. After
+        set_relative_to() is called, it instead tracks the primary arm's
+        live pose composed with the (once-computed) relative offset —
+        every other part of the PF/observation pipeline is unaware of the
+        difference, since this is the only thing that changes.
+        """
+        if self._explicit_anchor is not None:
+            return self._explicit_anchor
+        if self.primary_tracker is None:
+            return self.cam_T_b_kin
+        return self.primary_tracker.cam_T_b @ self.T_rel_bar
+
+    def set_relative_to(self, primary_tracker):
+        """Switch this tracker to track relative to primary_tracker's live
+        pose instead of this arm's own fixed hand-eye anchor.
+
+        Call once, after both this tracker's warmup() and primary_tracker's
+        warmup() have completed. Converts the current (warmup-derived)
+        absolute pose estimate into a relative offset from the primary's
+        current pose, so tracked pose is unchanged at the moment of the
+        switch — only the anchor that future frames' delta_T is estimated
+        around changes, from this arm's own calibration to the primary
+        arm's continuously-updated pose.
+        """
+        if self.primary_tracker is primary_tracker:
+            return
+        old_anchor = self._anchor_T().copy()
+        abs_pose = self.cam_T_b.copy()
+
+        self._explicit_anchor = None
+        self.primary_tracker = primary_tracker
+        self.T_rel_bar = np.linalg.inv(primary_tracker.cam_T_b) @ abs_pose
+
+        new_anchor = self._anchor_T().copy()
+        self._reanchor_particles(old_anchor, new_anchor)
+
+        t_mm = self.T_rel_bar[:3, 3] * 1000
+        r_deg = np.rad2deg(cv2.Rodrigues(self.T_rel_bar[:3, :3])[0].flatten())
+        print(
+            f"[{self.name}] now tracked relative to [{primary_tracker.name}]: "
+            f"T_rel = t=[{t_mm[0]:.1f},{t_mm[1]:.1f},{t_mm[2]:.1f}]mm "
+            f"r=[{r_deg[0]:.1f},{r_deg[1]:.1f},{r_deg[2]:.1f}]deg"
+        )
+
+    def refresh_relative_to(self, primary_tracker):
+        """Use Method 3's frame-local relative transform.
+
+        Immediately before the primary is updated at frame t, both trackers
+        still contain their estimates from t-1.  Refreshing
+
+            T_rel,t-1 = inv(T_primary,t-1) @ T_secondary,t-1
+
+        makes the secondary anchor become
+
+            T_primary,t @ T_rel,t-1
+          = Delta_T_primary,t @ T_secondary,t-1
+
+        after the primary update.  Thus only the primary's latest temporal
+        increment is transferred; no fixed inter-tool transform is retained.
+        Re-anchoring preserves every particle's absolute pose at refresh time.
+        """
+        old_anchor = self._anchor_T().copy()
+        abs_pose = self.cam_T_b.copy()
+        self.primary_tracker = primary_tracker
+        self.T_rel_bar = np.linalg.inv(primary_tracker.cam_T_b) @ abs_pose
+        self._reanchor_particles(old_anchor, self._anchor_T().copy())
+
+    def base_to_tool_pose(self):
+        """Current FK transform from the arm base to the tool frame."""
+        return self.robot_arm.baseToJointT[-3].copy()
+
+    def camera_to_tool_pose(self):
+        """Current estimated tool pose T^C_E = T^C_B T^B_E(q)."""
+        return self.cam_T_b @ self.base_to_tool_pose()
+
+    def apply_method3_tool_increment(self, primary_tracker, primary_increment,
+                                     previous_base_to_tool):
+        """Apply Method 3's camera-frame tool motion to every PF particle."""
+        old_anchor = self._anchor_T().copy()
+        particles = self.pf._particles
+        delta_R = Rotation.from_rotvec(particles[:, 3:]).as_matrix()
+        absolute_R = np.einsum("ij,njk->nik", old_anchor[:3, :3], delta_R)
+        absolute_t = (np.einsum("ij,nj->ni", old_anchor[:3, :3], particles[:, :3])
+                      + old_anchor[:3, 3])
+
+        current_base_to_tool = self.base_to_tool_pose()
+        fk_change = previous_base_to_tool @ np.linalg.inv(current_base_to_tool)
+        left_R, left_t = primary_increment[:3, :3], primary_increment[:3, 3]
+        right_R, right_t = fk_change[:3, :3], fk_change[:3, 3]
+        left_absolute_R = np.einsum("ij,njk->nik", left_R, absolute_R)
+        moved_R = np.einsum("nij,jk->nik", left_absolute_R, right_R)
+        moved_t = (np.einsum("ij,nj->ni", left_R, absolute_t) + left_t
+                   + np.einsum("nij,j->ni", left_absolute_R, right_t))
+
+        predicted_anchor = primary_increment @ self.cam_T_b @ fk_change
+        self.primary_tracker = primary_tracker
+        self.T_rel_bar = np.linalg.inv(primary_tracker.cam_T_b) @ predicted_anchor
+
+        anchor_R = predicted_anchor[:3, :3]
+        particles[:, :3] = np.einsum(
+            "ij,nj->ni", anchor_R.T, moved_t - predicted_anchor[:3, 3])
+        relative_R = np.einsum("ij,njk->nik", anchor_R.T, moved_R)
+        particles[:, 3:] = Rotation.from_matrix(relative_R).as_rotvec()
+        self.pose_state = self.pf.getMeanParticle()
+
+    def set_independent(self):
+        """Return to the tool's CTB baseline without changing absolute poses."""
+        if self.primary_tracker is None and self._explicit_anchor is None:
+            return
+        old_anchor = self._anchor_T().copy()
+        self.primary_tracker = None
+        self._explicit_anchor = None
+        self.T_rel_bar = np.eye(4)
+        self._reanchor_particles(old_anchor, self._anchor_T().copy())
+
+    def set_advisor_method3_anchor(self, predicted_cam_T_b):
+        """Update Method 3's frame-local prior while retaining PSM2 lump state.
+
+        The particle states and weights are intentionally left untouched, so
+        T_lump_2,t-1 and its posterior uncertainty propagate through the
+        ordinary PF motion model exactly as in the PDF formulation.
+        """
+        self.primary_tracker = None
+        self.T_rel_bar = np.eye(4)
+        self._explicit_anchor = np.asarray(predicted_cam_T_b, dtype=np.float64).copy()
+        self.pose_state = self.pf.getMeanParticle()
+
+    def initialize_advisor_method3_anchor(self, predicted_cam_T_b):
+        """Enter Method 3 once without changing any particle's world pose.
+
+        Warm-up particles are parameterized relative to cam_T_b_kin.  Simply
+        replacing that anchor while retaining their coordinates applies the
+        warm-up lump correction twice.  This one-time coordinate conversion
+        expresses the same weighted posterior relative to the Method-3 anchor;
+        later frames use set_advisor_method3_anchor() to propagate it normally.
+        """
+        old_anchor = self._anchor_T().copy()
+        new_anchor = np.asarray(predicted_cam_T_b, dtype=np.float64).copy()
+        self.primary_tracker = None
+        self.T_rel_bar = np.eye(4)
+        self._explicit_anchor = new_anchor
+        self._reanchor_particles(old_anchor, new_anchor)
+
+    def _reanchor_particles(self, old_anchor, new_anchor):
+        particles = self.pf._particles
+        delta_R = Rotation.from_rotvec(particles[:, 3:]).as_matrix()
+        absolute_R = np.einsum("ij,njk->nik", old_anchor[:3, :3], delta_R)
+        absolute_t = (np.einsum("ij,nj->ni", old_anchor[:3, :3], particles[:, :3])
+                      + old_anchor[:3, 3])
+        new_R = np.einsum("ij,njk->nik", new_anchor[:3, :3].T, absolute_R)
+        new_t = np.einsum(
+            "ij,nj->ni", new_anchor[:3, :3].T,
+            absolute_t - new_anchor[:3, 3])
+        particles[:, :3] = new_t
+        particles[:, 3:] = Rotation.from_matrix(new_R).as_rotvec()
+        self.pose_state = self.pf.getMeanParticle()
+
+    def prepare_frame(self, frame_idx=None, left_img=None, right_img=None,
+                      joint_angles=None, raw_l=None, raw_r=None):
+        return self._prepare_frame(
+            frame_idx, left_img, right_img, joint_angles, raw_l, raw_r)
+
+    def compute_prediction_unreliability(self, prep):
+        """Continuous prediction--detection inconsistency in [0,1]."""
+        if prep is None:
+            return 1.0
+        particles = self.pf._particles
+        weights = np.asarray(self.pf._weights, dtype=np.float64)
+        weights /= max(float(weights.sum()), 1e-300)
+        anchor = self._anchor_T()
+        delta_R = Rotation.from_rotvec(particles[:, 3:]).as_matrix()
+        R_eff = np.einsum("ij,njk->nik", anchor[:3, :3], delta_R)
+        t_eff = (np.einsum("ij,nj->ni", anchor[:3, :3], particles[:, :3])
+                 + anchor[:3, 3])
+        scores = []
+        details = {}
+        expected = sorted(LR_BASES | FB_BASES) + ["yaw_1", "yaw_2"]
+        for label in expected:
+            detection = prep["base_dets"].get(label)
+            if label in LR_BASES:
+                point_name = f"{label}:{self.feature_detector.curr_lr}"
+            elif label in FB_BASES:
+                point_name = f"{label}:{self.feature_detector.curr_fb}"
+            else:
+                point_name = label
+            point = prep["name2pt"].get(point_name)
+            if detection is None or point is None:
+                score = 1.0
+                details[label] = {"missing": True, "score": score}
+            else:
+                projected = _project_batch(point, R_eff, t_eff, self.K, self.dist)
+                mean = np.sum(weights[:, None] * projected, axis=0)
+                centered = projected - mean
+                covariance = np.einsum(
+                    "n,ni,nj->ij", weights, centered, centered) + np.eye(2) * 16.0
+                residual = np.asarray(detection[:2], dtype=np.float64) - mean
+                distance = float(np.sqrt(max(
+                    residual @ np.linalg.pinv(covariance) @ residual, 0.0)))
+                sigmoid = 1.0 / (1.0 + np.exp(-np.clip((distance - 3.0) / 0.5, -60, 60)))
+                confidence = float(np.clip(detection[2], 0.0, 1.0))
+                score = 1.0 - confidence * (1.0 - sigmoid)
+                details[label] = {"missing": False, "distance": distance,
+                                  "confidence": confidence, "score": score}
+            scores.append(score)
+        self.prediction_unreliability = float(np.mean(scores))
+        self.prediction_reliability_details = details
+        self.set_observation_variance_scale(1.0 + 3.0 * self.prediction_unreliability)
+        return self.prediction_unreliability
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
+
+    def _prepare_frame(
+        self,
+        frame_idx=None,
+        left_img=None,
+        right_img=None,
+        joint_angles=None,
+        raw_l=None,
+        raw_r=None,
+    ):
+        """Per-frame data prep shared by update() and joint-mode tracking
+        (tracking/joint_tracker.py): FK refresh, label assignment, the
+        obs-model's base_dets, and Canny+Hough shaft edge detection.
+
+        Args/Returns: see update() -- same signature, minus the PF step.
+        Returns a dict of everything the obs model / drawing code needs:
+            base_dets, name2pt, shaft_pos_b, shaft_dir_b,
+            detected_edges_hough, W, H, corrected, joint_angles
+        or None if kinematic data is unavailable for this frame.
+        """
+        if joint_angles is None:
+            try:
+                joint_angles, _ = load_kin_data(self.kin_dir, frame_idx)
+            except Exception:
+                return None
+
+        if self._j6_offset:
+            joint_angles = joint_angles.copy()
+            joint_angles[5] += self._j6_offset
+        self.robot_arm.updateJointAngles(joint_angles)
+        pts_3d, names = self.robot_arm.getPointFeatures()
+        self.name2pt = dict(zip(names, pts_3d))
+        if self._has_shaft:
+            # Shaft position/direction are joint-angle-dependent (they move
+            # with the wrist), so — like name2pt above — they must be
+            # refreshed every frame from the just-updated joint angles, not
+            # just once at __init__ time (which only ever saw the all-zero
+            # default pose RobotLink starts at).
+            shaft_pos_list, shaft_dir_list, _, _ = self.robot_arm.getShaftFeatures()
+            self._shaft_pos_b = shaft_pos_list[0]
+            self._shaft_dir_b = shaft_dir_list[0]
+
+        features = self.feature_detector.detect(
+            frame_idx, left_img, right_img, raw_l, raw_r,
+            name2pt=self.name2pt, P1=self.P1, P2=self.P2,
+            b_T_cam_kin=self.b_T_cam_kin, K=self.K, dist=self.dist,
+            robot_arm=self.robot_arm, cam_T_b_kin=self.cam_T_b_kin,
+            cam_T_b=self.cam_T_b, shaft_dir_b=self._shaft_dir_b, detection_noise=getattr(self, "detection_noise", None),
+            noise_peers=getattr(self, "noise_peers", {}),
+        )
+        return {
+            "base_dets": features.base_dets,
+            "name2pt": self.name2pt,
+            "shaft_pos_b": self._shaft_pos_b,
+            "shaft_dir_b": self._shaft_dir_b,
+            "detected_edges_hough": features.detected_edges_hough,
+            "W": features.width,
+            "H": features.height,
+            "corrected": features.corrected,
+            "joint_angles": joint_angles,
+        }
 
     def update(
         self,
@@ -236,103 +447,47 @@ class ArmTracker:
             joint_angles: Raw joint angle array.
             Returns (None, 0, {}) if kinematic data is unavailable.
         """
-        if raw_l is None:
-            raw_l = _get_detections(self.dlc_left, frame_idx, left_img)
-        if raw_r is None:
-            raw_r = _get_detections(self.dlc_right, frame_idx, right_img)
+        prep = self._prepare_frame(frame_idx, left_img, right_img, joint_angles, raw_l, raw_r)
+        return self.update_prepared(prep)
 
-        if joint_angles is None:
-            try:
-                joint_angles, _ = load_kin_data(self.kin_dir, frame_idx)
-            except Exception:
-                return None, 0, {}
+    def update_prepared(self, prep):
+        if prep is None:
+            return None, 0, {}
 
-        if self._j6_offset:
-            joint_angles = joint_angles.copy()
-            joint_angles[5] += self._j6_offset
-        self.robot_arm.updateJointAngles(joint_angles)
-        pts_3d, names = self.robot_arm.getPointFeatures()
-        self.name2pt = dict(zip(names, pts_3d))
-        if self._has_shaft:
-            # Shaft position/direction are joint-angle-dependent (they move
-            # with the wrist), so — like name2pt above — they must be
-            # refreshed every frame from the just-updated joint angles, not
-            # just once at __init__ time (which only ever saw the all-zero
-            # default pose RobotLink starts at).
-            shaft_pos_list, shaft_dir_list, _, _ = self.robot_arm.getShaftFeatures()
-            self._shaft_pos_b = shaft_pos_list[0]
-            self._shaft_dir_b = shaft_dir_list[0]
-
-        corrected, self.curr_lr, self.curr_fb, self._last_state_label = assign_labels(
-            raw_l,
-            raw_r,
-            self.name2pt,
-            self.P1,
-            self.P2,
-            self.b_T_cam_kin,
-            self.K,
-            self.dist,
-            self.robot_arm,
-            self.cam_T_b_kin,
-            self.curr_lr,
-            self.curr_fb,
-            cam_T_b=self.cam_T_b,
-        )
-
-        # Raw per-joint detections (LIKELIHOOD_THRESH_OPT applied), keyed by the
-        # generic joint name — left/right, front/back, and yaw-tip identity is
-        # NOT resolved here. That's left to the observation model, which
-        # resolves it per particle from that particle's own hypothesised pose
-        # rather than committing to one assignment
-        # per frame the way `corrected` (from assign_labels above) does.
-        base_dets = {}
-        for base in LR_BASES | FB_BASES:
-            best = None
-            for cand_key in (
-                f"{base}:left",
-                f"{base}:right",
-                f"{base}:front",
-                f"{base}:back",
-                base,
-            ):
-                det = raw_l.get(cand_key)
-                if det is not None and det[2] >= LIKELIHOOD_THRESH_OPT:
-                    if best is None or det[2] > best[2]:
-                        best = det
-            if best is not None:
-                base_dets[base] = best
-        for yaw in ("yaw_1", "yaw_2"):
-            det = raw_l.get(yaw)
-            if det is not None and det[2] >= LIKELIHOOD_THRESH_OPT:
-                base_dets[yaw] = det
-
-        # Canny+Hough shaft edge detection
-        if self._shaft_params is not None and left_img is not None and SHAFT_USE_HOUGH:
-            self._run_canny_hough(left_img, corrected)
-        else:
-            self._last_detected_segs = []
-            self._last_raw_hough = None
+        self.last_keypoint_detections = prep["corrected"]
 
         self.pf.predictionStep_vec(std=DELTA_PROCESS_STD)
-        H_img, W_img = left_img.shape[:2] if left_img is not None else (None, None)
-        self.pf.updateStep_vec(
-            self._vec_obs_func,
-            base_dets=base_dets,
-            name2pt=self.name2pt,
+        obs_kwargs = dict(
+            base_dets=prep["base_dets"],
+            name2pt=prep["name2pt"],
             robot_arm=self.robot_arm,
             K=self.K,
             dist=self.dist,
-            shaft_pos_b=self._shaft_pos_b,
-            shaft_dir_b=self._shaft_dir_b,
-            detected_edges_hough=self._last_raw_hough,
-            W=W_img,
-            H=H_img,
+            shaft_pos_b=prep["shaft_pos_b"],
+            shaft_dir_b=prep["shaft_dir_b"],
+            detected_edges_hough=prep["detected_edges_hough"],
+            W=prep["W"],
+            H=prep["H"],
+        )
+        log_obs = self._overlap_scaled_obs(self.pf._particles, **obs_kwargs)
+        finite = np.isfinite(log_obs)
+        if np.any(finite):
+            maximum = float(np.max(log_obs[finite]))
+            weighted = np.sum(
+                self.pf._weights[finite] * np.exp(log_obs[finite] - maximum))
+            self.last_log_evidence = maximum + np.log(max(float(weighted), 1e-300))
+        else:
+            self.last_log_evidence = -np.inf
+        self.pf.updateStep_vec(
+            self._overlap_scaled_obs,
+            **obs_kwargs,
         )
 
         self.pose_state = self.pf.getMeanParticle()
 
-        R_kin = self.cam_T_b_kin[:3, :3]
-        t_kin = self.cam_T_b_kin[:3, 3]
+        anchor = self._anchor_T()
+        R_kin = anchor[:3, :3]
+        t_kin = anchor[:3, 3]
 
         R_delta, _ = cv2.Rodrigues(self.pose_state[3:].reshape(3, 1))
         t_delta = self.pose_state[:3]
@@ -340,7 +495,16 @@ class ArmTracker:
         self.cam_T_b[:3, :3] = R_kin @ R_delta
         self.cam_T_b[:3, 3] = R_kin @ t_delta + t_kin
 
-        return corrected, len(base_dets), joint_angles
+        return prep["corrected"], len(prep["base_dets"]), prep["joint_angles"]
+
+    def set_observation_variance_scale(self, scale):
+        """Set R_t/R_0 for overlap-adaptive likelihood tempering."""
+        self.observation_variance_scale = max(float(scale), 1.0)
+
+    def _overlap_scaled_obs(self, particles, **kwargs):
+        return self._vec_obs_func(
+            particles, point_variance_scale=self.observation_variance_scale,
+            **kwargs)
 
     # ------------------------------------------------------------------
     # Warm-up
@@ -381,7 +545,7 @@ class ArmTracker:
         delta_estimates = []
 
         for frame_idx in frame_list:
-            raw_l = _get_detections(self.dlc_left, frame_idx, None)
+            raw_l = self.feature_detector.get_keypoints(self.dlc_left, frame_idx, None)
             try:
                 joint_angles, _ = load_kin_data(self.kin_dir, frame_idx)
             except Exception:
@@ -394,14 +558,14 @@ class ArmTracker:
         if init_std is None:
             return
 
-        if left_img_dir is not None and self._shaft_params is not None:
+        if left_img_dir is not None and self.feature_detector.shaft_params is not None:
 
             def _offline_frames():
                 for frame_idx in frame_list:
                     left_img = cv2.imread(os.path.join(left_img_dir, f"{frame_idx}.png"))
                     if left_img is None:
                         continue
-                    raw_l = _get_detections(self.dlc_left, frame_idx, None)
+                    raw_l = self.feature_detector.get_keypoints(self.dlc_left, frame_idx, None)
                     try:
                         joint_angles, _ = load_kin_data(self.kin_dir, frame_idx)
                     except Exception:
@@ -446,7 +610,7 @@ class ArmTracker:
         if init_std is None:
             return
 
-        if self._shaft_params is not None:
+        if self.feature_detector.shaft_params is not None:
 
             def _live_frames():
                 for left_img, joint_angles, raw_l in frame_list:
@@ -456,13 +620,14 @@ class ArmTracker:
 
             self._correct_shaft_angle(_live_frames(), init_std)
 
-    def _pnp_delta_estimate(self, raw_l, joint_angles, min_pts, pnp_error, lkl_thresh):
-        """Estimate delta_T for a single frame via PnP (shared by warmup() and
-        warmup_live()). Mutates self.name2pt as a side effect (refreshed to
-        match this frame's joint angles).
+    def _frame_correspondences(self, raw_l, joint_angles, lkl_thresh):
+        """Compute this frame's 3-D (this arm's own base frame) <-> 2-D PnP
+        correspondences. Mutates self.name2pt as a side effect (refreshed to
+        match this frame's joint angles). Shared by _pnp_delta_estimate()
+        (single-arm PnP, used by warmup()/warmup_live()) and
+        tracking/joint_tracker.py's pooled two-arm PnP warmup.
 
-        Returns a (6,) [t, rvec] delta_T array, or None if this frame doesn't
-        yield a usable estimate (too few correspondences, or PnP failure).
+        Returns (obj_pts, img_pts) lists (possibly empty).
         """
         if self._j6_offset:
             joint_angles = joint_angles.copy()
@@ -471,7 +636,7 @@ class ArmTracker:
         pts_3d, names = self.robot_arm.getPointFeatures()
         self.name2pt = dict(zip(names, pts_3d))
 
-        corrected, _, _, _ = assign_labels(
+        corrected, _, _, _ = self.feature_detector.assign_labels(
             raw_l,
             None,
             self.name2pt,
@@ -482,8 +647,8 @@ class ArmTracker:
             self.dist,
             self.robot_arm,
             self.cam_T_b_kin,
-            self.curr_lr,
-            self.curr_fb,
+            self.feature_detector.curr_lr,
+            self.feature_detector.curr_fb,
             cam_T_b=self.cam_T_b,
         )
 
@@ -492,7 +657,16 @@ class ArmTracker:
             if lkl >= lkl_thresh and bp in self.name2pt:
                 obj_pts.append(self.name2pt[bp])
                 img_pts.append([x, y])
+        return obj_pts, img_pts
 
+    def _pnp_delta_estimate(self, raw_l, joint_angles, min_pts, pnp_error, lkl_thresh):
+        """Estimate delta_T for a single frame via PnP (shared by warmup() and
+        warmup_live()).
+
+        Returns a (6,) [t, rvec] delta_T array, or None if this frame doesn't
+        yield a usable estimate (too few correspondences, or PnP failure).
+        """
+        obj_pts, img_pts = self._frame_correspondences(raw_l, joint_angles, lkl_thresh)
         if len(obj_pts) < min_pts:
             return None
 
@@ -547,6 +721,9 @@ class ArmTracker:
 
         self.pf.initializeFilter(mean_state=mean_state, std=init_std)
         self.pose_state = mean_state.copy()
+        # Remembered so set_relative_to() can re-seed with a comparable
+        # spread instead of falling back to the generic constructor default.
+        self._last_init_std = init_std.copy()
 
         t_mm = mean_state[:3] * 1000
         r_deg = np.rad2deg(mean_state[3:])
@@ -586,7 +763,7 @@ class ArmTracker:
         self.cam_T_b[:3, :3] = R_kin @ R_delta
         self.cam_T_b[:3, 3] = R_kin @ self.pose_state[:3] + t_kin
 
-        self._ema_lines = None
+        self.feature_detector.ema_lines = None
         for left_img, joint_angles, raw_l in frame_source:
             if left_img is None:
                 continue
@@ -598,7 +775,7 @@ class ArmTracker:
             pts_3d, names = self.robot_arm.getPointFeatures()
             self.name2pt = dict(zip(names, pts_3d))
 
-            corrected, _, _, _ = assign_labels(
+            corrected, _, _, _ = self.feature_detector.assign_labels(
                 raw_l,
                 None,
                 self.name2pt,
@@ -609,13 +786,21 @@ class ArmTracker:
                 self.dist,
                 self.robot_arm,
                 self.cam_T_b_kin,
-                self.curr_lr,
-                self.curr_fb,
+                self.feature_detector.curr_lr,
+                self.feature_detector.curr_fb,
                 cam_T_b=self.cam_T_b,
             )
-            self._run_canny_hough(left_img, corrected)
+            self.feature_detector.detect_shaft(
+                left_img, corrected,
+                frame_idx=getattr(self, "_current_frame_idx", None),
+                noise=getattr(self, "detection_noise", None),
+                noise_peers=getattr(self, "noise_peers", {}),
+                shaft_dir_b=self._shaft_dir_b,
+                cam_T_b_kin=self.cam_T_b_kin,
+                K=self.K,
+            )
 
-        if self._ema_lines is None:
+        if self.feature_detector.ema_lines is None:
             print(f"[{self.name}] warmup: no shaft edges detected — angle uncorrected")
             return
 
@@ -625,7 +810,7 @@ class ArmTracker:
         dir_b = shaft_dir_list[0] / np.linalg.norm(shaft_dir_list[0])
 
         # EMA midline angle (Hough NORMAL-angle convention, from cv2.HoughLines).
-        thetas = [th for _, th in self._ema_lines]
+        thetas = [th for _, th in self.feature_detector.ema_lines]
         theta_mid = np.arctan2(np.mean(np.sin(thetas)), np.mean(np.cos(thetas))) % np.pi
 
         d_cam = self.cam_T_b[:3, :3] @ dir_b
@@ -665,145 +850,8 @@ class ArmTracker:
         print(f"[{self.name}] warmup: shaft-angle correction {np.rad2deg(dtheta):+.2f} deg")
 
     @staticmethod
-    def _hough_to_seg(rho, theta, h, w):
-        """Clip HoughLines (rho, theta) infinite line to ROI rectangle."""
-        a, b = np.cos(theta), np.sin(theta)
-        pts = []
-        for xb in (0, w - 1):
-            if abs(b) > 1e-6:
-                yb = (rho - xb * a) / b
-                if 0 <= yb <= h - 1:
-                    pts.append((xb, int(round(yb))))
-        for yb in (0, h - 1):
-            if abs(a) > 1e-6:
-                xb = (rho - yb * b) / a
-                if 0 <= xb <= w - 1:
-                    pts.append((int(round(xb)), yb))
-        if len(pts) < 2:
-            return None
-        return (pts[0][0], pts[0][1], pts[-1][0], pts[-1][1])
 
-    def _ema_segs_from_lines(self, off_x, off_y, h_roi, w_roi):
-        """Return segments from EMA Hough lines, or [] if EMA not yet initialised."""
-        if self._ema_lines is None:
-            return []
-        H_full = h_roi + off_y
-        W_full = w_roi + off_x
-        segs = []
-        for rho, theta in self._ema_lines:
-            seg = self._hough_to_seg(rho, theta, H_full, W_full)
-            if seg is not None:
-                segs.append(seg)
-        return segs if len(segs) == 2 else []
 
-    def _run_canny_hough(self, left_img: np.ndarray, corrected: dict):
-        """Detect shaft edges with the shared Canny+HoughLines pipeline
-        (tracking/canny_hough.py) and store the result in
-        _last_detected_segs / _last_raw_hough.
-
-        Uses the exact same process()/get_roi() as test_canny_hough.py's
-        interactive tuner, so self._shaft_params (loaded from a dataset's
-        canny_params_{arm}.json, or _SHAFT_CANNY_PARAMS as a fallback)
-        actually takes effect here instead of a separately hand-ported
-        approximation drifting out of sync with the tuner.
-        """
-        p = self._shaft_params
-        H, W = left_img.shape[:2]
-
-        # ROI centre: highest-likelihood keypoint
-        if corrected:
-            best = max(corrected.values(), key=lambda v: v[2])
-            tx, ty = int(round(best[0])), int(round(best[1]))
-        else:
-            self._last_detected_segs = self._ema_segs_from_lines(0, 0, H, W)
-            self._last_raw_hough = None
-            return
-        if not (0 <= tx < W and 0 <= ty < H):
-            self._last_detected_segs = self._ema_segs_from_lines(0, 0, H, W)
-            self._last_raw_hough = None
-            return
-
-        roi, off_x, off_y = _hough_get_roi(
-            left_img, (tx, ty), p["roi_pad"], self.name, H, W, p.get("edge_margin", 0)
-        )
-        h_roi, w_roi = roi.shape[:2]
-
-        if roi.size == 0:
-            self._last_detected_segs = self._ema_segs_from_lines(off_x, off_y, h_roi, w_roi)
-            self._last_raw_hough = None
-            return
-
-        # FK shaft-angle prior (fixed kinematic extrinsic -- same convention
-        # as test_canny_hough.py's main()), used only to restrict Hough's
-        # angle search band, not to draw or correct the tracked pose.
-        expected_angle = None
-        if self._shaft_dir_b is not None:
-            dir_b = self._shaft_dir_b / np.linalg.norm(self._shaft_dir_b)
-            d_cam = self.cam_T_b_kin[:3, :3] @ dir_b
-            if d_cam[2] < 0:
-                d_cam = -d_cam
-            if d_cam[2] > 1e-6:
-                theta_pred_dir = np.arctan2(
-                    self.K[1, 1] * d_cam[1] / d_cam[2], self.K[0, 0] * d_cam[0] / d_cam[2]
-                )
-                expected_angle = np.degrees(theta_pred_dir) % 180
-
-        params = dict(p)
-        params["expected_angle"] = expected_angle
-        if self._prev_final_global is not None:
-            params["prior_rhos"] = [
-                rho_g - (off_x * np.cos(theta_g) + off_y * np.sin(theta_g))
-                for rho_g, theta_g in self._prev_final_global
-            ]
-        else:
-            params["prior_rhos"] = None
-
-        _, _, _, final = _hough_process(roi, params)
-
-        if len(final) < 2:
-            # No detection: fall back to last EMA value if available. Keep
-            # _prev_final_global as-is (don't reset the temporal prior on a
-            # single missed frame).
-            self._last_detected_segs = self._ema_segs_from_lines(off_x, off_y, h_roi, w_roi)
-            self._last_raw_hough = None
-            return
-
-        full_lines = [
-            (rho_l + off_x * np.cos(theta_l) + off_y * np.sin(theta_l), theta_l)
-            for rho_l, theta_l in final
-        ]
-        full_lines.sort(key=lambda x: x[0])
-        self._prev_final_global = full_lines
-
-        # This frame's raw (theta, rho_c) detection for the PF likelihood — image-centre-origin
-        # convention (matches shaft_edge.py's line_to_hough), NOT the EMA-smoothed line below.
-        # Fed straight into the filter with no temporal smoothing of its own.
-        self._last_raw_hough = [
-            (theta, rho - (W / 2) * np.cos(theta) - (H / 2) * np.sin(theta))
-            for rho, theta in full_lines
-        ]
-
-        # EMA update (drawing / dropout-fallback only, not fed to the PF likelihood)
-        a = SHAFT_EDGE_EMA_ALPHA
-        if self._ema_lines is None:
-            self._ema_lines = full_lines
-        else:
-            smoothed = []
-            for (re, te), (rn, tn) in zip(self._ema_lines, full_lines):
-                # Wrap theta to avoid discontinuity near 0/pi boundary
-                if abs(tn - te) > np.pi / 2:
-                    tn = tn - np.pi if tn > te else tn + np.pi
-                smoothed.append(((1 - a) * re + a * rn, (1 - a) * te + a * tn))
-            self._ema_lines = smoothed
-
-        # Convert smoothed Hough lines back to segments for obs model
-        segs = []
-        H_full, W_full = left_img.shape[:2]
-        for rho, theta in self._ema_lines:
-            seg = self._hough_to_seg(rho, theta, H_full, W_full)
-            if seg is not None:
-                segs.append(seg)
-        self._last_detected_segs = segs if len(segs) == 2 else []
 
     def draw(self, vis_img: np.ndarray, corrected: dict):
         """Draw skeleton, keypoints, and the detected shaft edges.
@@ -811,12 +859,12 @@ class ArmTracker:
         The FK skeleton's shaft segment is replaced with a single merged
         line from the detected edge midline when available (smoothed,
         FK-anchored — shows the filter's belief). The two raw Canny+Hough
-        detected edges (self._last_detected_segs, EMA-smoothed but otherwise
+        detected edges (self.feature_detector.last_detected_segs, EMA-smoothed but otherwise
         exactly what the detector found) are drawn separately in cyan, so
         detection quality/failures are visible directly instead of being
         hidden behind the FK-anchored reconstruction.
         """
-        use_ema_shaft = self._shaft_params is not None and self._ema_lines is not None
+        use_ema_shaft = self.feature_detector.shaft_params is not None and self.feature_detector.ema_lines is not None
 
         # Draw wrist/jaw segments (skip shaft index 0 when using EMA line)
         project_skeleton(
@@ -832,10 +880,10 @@ class ArmTracker:
         # the link4 projection — a single line, not the two raw detected
         # edges. Purely cosmetic: does not feed back into pose_state/cam_T_b
         # (the PF likelihood uses the raw per-frame detection instead, see
-        # self._last_raw_hough).
+        # self.feature_detector.last_raw_hough).
         if use_ema_shaft:
             H, W = vis_img.shape[:2]
-            thetas = [th for _, th in self._ema_lines]
+            thetas = [th for _, th in self.feature_detector.ema_lines]
             theta_mid = np.arctan2(np.mean(np.sin(thetas)), np.mean(np.cos(thetas))) % np.pi
             cos_t, sin_t = np.cos(theta_mid), np.sin(theta_mid)
 
@@ -870,7 +918,7 @@ class ArmTracker:
         # Draw the two raw detected shaft edges (Canny+Hough, EMA-smoothed
         # but not FK-anchored) directly, so the actual detection is visible
         # regardless of whether the FK-anchored midline above looks right.
-        for x1, y1, x2, y2 in self._last_detected_segs:
+        for x1, y1, x2, y2 in self.feature_detector.last_detected_segs:
             cv2.line(vis_img, (x1, y1), (x2, y2), (255, 255, 0), 1)
 
         draw_keypoints(vis_img, corrected, self.kp_color)

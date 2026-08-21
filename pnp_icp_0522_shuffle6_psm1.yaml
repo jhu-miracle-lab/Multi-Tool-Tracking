@@ -1,0 +1,10 @@
+PSM1_rvec:
+- 0.566121155291602
+- -2.93243576870864
+- 0.25862347492568233
+PSM1_tvec:
+- 127.31721533000673
+- 10.180155938770254
+- 37.90542038437785
+note: "ICP calibration: backproject DLC 2-D \u2192 3-D using FK-derived depth, SVD\
+  \ M-step, Huber refinement. Left-camera mono, 96 frames. Final RMSE=22.93 px."

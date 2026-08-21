@@ -11,11 +11,12 @@ consumed by tracking/observation.py's create_combined_obs_model_vec().
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Cylinder projection (Liang 2025 Eq. 1 / Doignon & Mathelin 2007)
+# Cylinder projection (Richter et al. 2022, "Robotic Tool Tracking Under
+# Partially Visible Kinematic Chain", Appendix C / Doignon & Mathelin 2007)
 # ---------------------------------------------------------------------------
 
 
-def predict_shaft_edges_hough_batch(p_c_0_all, d_c_all, r, W, H):
+def predict_shaft_edges_hough_batch(p_c_0_all, d_c_all, r, W, H, K):
     """Vectorised per-particle shaft edge prediction via cylinder projection.
 
     Args:
@@ -23,11 +24,15 @@ def predict_shaft_edges_hough_batch(p_c_0_all, d_c_all, r, W, H):
         d_c_all:   (N, 3) unit shaft directions in camera frame.
         r:         shaft radius (same units as p_c_0_all, metres).
         W, H:      image width and height.
+        K:         (3, 3) camera intrinsic matrix.
 
     Returns:
         edges: (N, 2, 2) — axes: [particle, edge_index, (θ, ρ_c)].
         valid: (N,) bool — False where the camera is inside or on the cylinder.
     """
+    fx_cam, fy_cam = K[0, 0], K[1, 1]
+    cx_cam, cy_cam = K[0, 2], K[1, 2]
+
     x0, y0, z0 = p_c_0_all[:, 0], p_c_0_all[:, 1], p_c_0_all[:, 2]
     a, b, c = d_c_all[:, 0], d_c_all[:, 1], d_c_all[:, 2]
 
@@ -51,6 +56,20 @@ def predict_shaft_edges_hough_batch(p_c_0_all, d_c_all, r, W, H):
         B = fy + sign * cy
         C = fz + sign * cz
 
+        # (A, B, C) is the tangent plane's normal, giving the shaft edge as
+        # a line A*X + B*Y + C = 0 in NORMALIZED camera-ray coordinates
+        # (X, Y) = (x/z, y/z) -- i.e. a "unit camera" with f=1, no
+        # principal-point offset. Converting to a real pixel-space Hough
+        # line requires substituting X=(u-c_x)/f_x, Y=(v-c_y)/f_y (Richter
+        # et al. 2022 Eq. 50) BEFORE normalizing to (theta, rho) -- omitting
+        # this (as an earlier version of this function did) silently
+        # computes theta/rho in the normalized-ray domain instead of pixels
+        # (implicitly f_x=f_y=1, c_x=c_y=0), which is off from true pixel
+        # rho by roughly a factor of f_x (~1000x for this project's camera)
+        # and isn't a fixed rescale of LUMPED_GAMMA_RHO/LUMPED_CMAX_EDGE
+        # away since rho is only part of the tuned cost -- see constants.py.
+        A, B, C = A / fx_cam, B / fy_cam, C - A * cx_cam / fx_cam - B * cy_cam / fy_cam
+
         safe_norm = np.maximum(np.sqrt(A**2 + B**2), 1e-12)
         A, B, C = A / safe_norm, B / safe_norm, C / safe_norm
 
@@ -66,7 +85,7 @@ def predict_shaft_edges_hough_batch(p_c_0_all, d_c_all, r, W, H):
 
 
 def lumped_edge_log_likelihood(
-    p_c_0_all, d_c_all, detected_edges_hough, r, W, H, gamma_rho, gamma_phi, c_max
+    p_c_0_all, d_c_all, detected_edges_hough, r, W, H, K, gamma_rho, gamma_phi, c_max
 ):
     """Vectorised per-particle shaft edge log-likelihood: L1 association cost,
     summed exponential probability over the two matched edges plus a missed-detection term.
@@ -83,6 +102,7 @@ def lumped_edge_log_likelihood(
                               detector (tracking/canny_hough.py), or
                               None/not length 2 if no detection this frame.
         r, W, H:              shaft radius, image dimensions.
+        K:                    (3, 3) camera intrinsic matrix.
         gamma_rho, gamma_phi: L1 cost weights for rho [1/px] and theta [1/rad].
         c_max:                per-edge cost cap used for the missed-detection term.
 
@@ -93,7 +113,7 @@ def lumped_edge_log_likelihood(
     if detected_edges_hough is None or len(detected_edges_hough) != 2:
         return np.full(n_particles, np.log(2.0 * np.exp(-c_max) + 1e-300))
 
-    pred_edges, valid = predict_shaft_edges_hough_batch(p_c_0_all, d_c_all, r, W, H)
+    pred_edges, valid = predict_shaft_edges_hough_batch(p_c_0_all, d_c_all, r, W, H, K)
 
     det_t1, det_r1 = detected_edges_hough[0]
     det_t2, det_r2 = detected_edges_hough[1]

@@ -65,14 +65,19 @@ def _project_batch(pts3d_b, R_eff, t_eff, K, dist):
     return np.stack([K[0, 0] * xd + K[0, 2], K[1, 1] * yd + K[1, 2]], axis=1)  # (N,2)
 
 
-def create_delta_obs_model_vec(cam_T_b_kin_getter):
+def create_delta_obs_model_vec(cam_T_b_kin_getter, extra_T=None):
     """Vectorised point observation model for delta_T state
 
     State = [dtx, dty, dtz, drx, dry, drz]; zero = identity = FK is perfect.
-    Effective pose: cam_T_b = cam_T_b_kin @ delta_T
+    Effective pose: cam_T_b = cam_T_b_kin @ delta_T @ extra_T
 
     Args:
         cam_T_b_kin_getter: callable () -> (4,4) fixed FK extrinsic.
+        extra_T: optional fixed (4,4) transform applied between delta_T and
+                 the incoming base-frame points/robot_arm, e.g. a second
+                 arm's known base-to-base transform for joint-optimization
+                 tracking (see tracking/joint_tracker.py). None (default) =
+                 identity, reproducing the single-arm formula exactly.
 
     Returns:
         Callable (particles, base_dets, name2pt, robot_arm, K, dist) -> (N,) log-weights.
@@ -80,6 +85,8 @@ def create_delta_obs_model_vec(cam_T_b_kin_getter):
                    already likelihood-thresholded by the caller, keyed by
                    the generic joint name (e.g. 'roll_2', not 'roll_2:left').
     """
+    extra_R = np.eye(3) if extra_T is None else extra_T[:3, :3]
+    extra_t = np.zeros(3) if extra_T is None else extra_T[:3, 3]
 
     def _vec_obs(particles, base_dets, name2pt, robot_arm, K, dist):
         if not base_dets:
@@ -90,8 +97,12 @@ def create_delta_obs_model_vec(cam_T_b_kin_getter):
         t_kin = cam_T_b_kin[:3, 3]
 
         R_delta = Rotation.from_rotvec(particles[:, 3:]).as_matrix()  # (N,3,3)
-        R_eff = np.einsum("ij,njk->nik", R_kin, R_delta)  # (N,3,3)
-        t_eff = np.einsum("ij,nj->ni", R_kin, particles[:, :3]) + t_kin  # (N,3)
+        R_delta_extra = np.einsum("nij,jk->nik", R_delta, extra_R)  # R_delta @ extra_R
+        R_eff = np.einsum("ij,njk->nik", R_kin, R_delta_extra)  # R_kin @ R_delta @ extra_R
+        t_delta_extra = (
+            np.einsum("nij,j->ni", R_delta, extra_t) + particles[:, :3]
+        )  # R_delta @ extra_t + t_delta
+        t_eff = np.einsum("ij,nj->ni", R_kin, t_delta_extra) + t_kin
 
         N = len(particles)
         sum_prob = np.zeros(N)
@@ -148,7 +159,7 @@ def create_delta_obs_model_vec(cam_T_b_kin_getter):
     return _vec_obs
 
 
-def create_combined_obs_model_vec(cam_T_b_kin_getter, shaft_radius):
+def create_combined_obs_model_vec(cam_T_b_kin_getter, shaft_radius, extra_T=None):
     """Joint point + shaft-edge log-likelihood for a single PF weight update
     (Algorithm 1, lines 20-23: point and edge observations feed the same
     per-particle weight rather than being applied separately).
@@ -157,6 +168,8 @@ def create_combined_obs_model_vec(cam_T_b_kin_getter, shaft_radius):
         cam_T_b_kin_getter: callable () -> (4,4) fixed FK extrinsic.
         shaft_radius:       shaft radius [m], or None if this arm has no
                             shaft edge model (falls back to point-only).
+        extra_T: optional fixed (4,4) transform between delta_T and the
+                 incoming base-frame points (see create_delta_obs_model_vec).
 
     Returns:
         Callable (particles, base_dets, name2pt, robot_arm, K, dist,
@@ -165,7 +178,9 @@ def create_combined_obs_model_vec(cam_T_b_kin_getter, shaft_radius):
     """
     from .shaft_edge import lumped_edge_log_likelihood
 
-    point_fn = create_delta_obs_model_vec(cam_T_b_kin_getter)
+    point_fn = create_delta_obs_model_vec(cam_T_b_kin_getter, extra_T)
+    extra_R = np.eye(3) if extra_T is None else extra_T[:3, :3]
+    extra_t = np.zeros(3) if extra_T is None else extra_T[:3, 3]
 
     def _combined(
         particles,
@@ -179,8 +194,10 @@ def create_combined_obs_model_vec(cam_T_b_kin_getter, shaft_radius):
         detected_edges_hough=None,
         W=None,
         H=None,
+        point_variance_scale=1.0,
     ):
-        log_pts = point_fn(particles, base_dets, name2pt, robot_arm, K, dist)
+        log_pts = (point_fn(particles, base_dets, name2pt, robot_arm, K, dist)
+                   / max(float(point_variance_scale), 1.0))
 
         if shaft_radius is None or shaft_pos_b is None or shaft_dir_b is None:
             return log_pts
@@ -190,8 +207,12 @@ def create_combined_obs_model_vec(cam_T_b_kin_getter, shaft_radius):
         t_kin = cam_T_b_kin[:3, 3]
 
         R_delta = Rotation.from_rotvec(particles[:, 3:]).as_matrix()  # (N,3,3)
-        R_eff = np.einsum("ij,njk->nik", R_kin, R_delta)  # (N,3,3)
-        t_eff = np.einsum("ij,nj->ni", R_kin, particles[:, :3]) + t_kin  # (N,3)
+        R_delta_extra = np.einsum("nij,jk->nik", R_delta, extra_R)  # R_delta @ extra_R
+        R_eff = np.einsum("ij,njk->nik", R_kin, R_delta_extra)  # R_kin @ R_delta @ extra_R
+        t_delta_extra = (
+            np.einsum("nij,j->ni", R_delta, extra_t) + particles[:, :3]
+        )  # R_delta @ extra_t + t_delta
+        t_eff = np.einsum("ij,nj->ni", R_kin, t_delta_extra) + t_kin
 
         p_c_0_all = np.einsum("nij,j->ni", R_eff, shaft_pos_b) + t_eff  # (N,3)
         d_c_all = np.einsum("nij,j->ni", R_eff, shaft_dir_b)  # (N,3)
@@ -204,6 +225,7 @@ def create_combined_obs_model_vec(cam_T_b_kin_getter, shaft_radius):
             shaft_radius,
             W,
             H,
+            K,
             gamma_rho=LUMPED_GAMMA_RHO,
             gamma_phi=LUMPED_GAMMA_PHI,
             c_max=LUMPED_CMAX_EDGE,
