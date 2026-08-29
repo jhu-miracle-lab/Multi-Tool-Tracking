@@ -1,6 +1,7 @@
 """Surgical tool tracking package."""
 
 from .arm_tracker import ArmTracker
+from .combined_tracker import CombinedArmTracker
 from .arm_configs import build_arm_configs
 from .joint_tracker import JointTracker
 from .stereo import SimpleProjector
@@ -11,6 +12,7 @@ from .constants import DLC_W, DLC_H, CAL_W, CAL_H
 
 __all__ = [
     "ArmTracker",
+    "CombinedArmTracker",
     "build_arm_configs",
     "JointTracker",
     "SimpleProjector",
