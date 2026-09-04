@@ -1209,10 +1209,6 @@ class ArmTracker:
         self._pending_std = init_std
         print(f"[{self.name}] warmup: shaft-angle correction {np.rad2deg(dtheta):+.2f} deg")
 
-    @staticmethod
-
-
-
     def draw(self, vis_img: np.ndarray, corrected: dict):
         """Draw skeleton, keypoints, and the detected shaft edges.
 

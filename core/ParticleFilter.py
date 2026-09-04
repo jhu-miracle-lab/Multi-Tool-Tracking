@@ -66,29 +66,41 @@ class ParticleFilter:
         """Vectorised prediction: zero-mean Gaussian random walk (Wiener process)."""
         self._particles = self._particles + np.random.normal(0, std, self._particles.shape)
 
-    def updateStep_vec(self, vec_obs_func, **kwargs):
+    def updateStep_vec(self, vec_obs_func, resample_col_blocks=None, **kwargs):
         """Vectorised update: vec_obs_func(particles, **kwargs) -> log_weights (N,)"""
         log_obs = vec_obs_func(self._particles, **kwargs)
         log_obs -= log_obs.max()
         self._weights = self._weights * np.exp(log_obs)
         self.normalizeWeights()
         if self._min_num_effective_particles > 1.0 / np.sum(self._weights**2):
-            self._particles = self._particles[self.resample(), :]
+            idx = self.resample()
+            if resample_col_blocks is None:
+                self._particles = self._particles[idx, :]
+            else:
+                resampled = self._particles[idx, :]
+                for start, end in resample_col_blocks:
+                    self._particles[:, start:end] = resampled[:, start:end]
             self._weights = np.ones(len(self._particles)) / float(len(self._particles))
 
     def getMeanParticle(self):
         self.normalizeWeights()
-        # Translation: weighted Euclidean mean
-        mean_trans = np.dot(self._weights, self._particles[:, :3])
+        if self._particles.shape[1] % 6 != 0:
+            raise ValueError(
+                "Particle state must contain one or more 6-DoF pose blocks"
+            )
 
-        # Rotation: weighted mean on SO(3) via rotation-matrix averaging + SVD projection.
-        R_mats = Rotation.from_rotvec(self._particles[:, 3:]).as_matrix()  # (N,3,3)
-        R_avg = np.einsum("n,nij->ij", self._weights, R_mats)  # weighted sum
-        U, _, Vt = np.linalg.svd(R_avg)
-        R_proj = U @ Vt
-        if np.linalg.det(R_proj) < 0:  # ensure proper rotation (det=+1)
-            U[:, -1] *= -1
+        mean_blocks = []
+        for start in range(0, self._particles.shape[1], 6):
+            block = self._particles[:, start:start + 6]
+            mean_trans = np.dot(self._weights, block[:, :3])
+            R_mats = Rotation.from_rotvec(block[:, 3:6]).as_matrix()
+            R_avg = np.einsum("n,nij->ij", self._weights, R_mats)
+            U, _, Vt = np.linalg.svd(R_avg)
             R_proj = U @ Vt
-        mean_rot = Rotation.from_matrix(R_proj).as_rotvec()
+            if np.linalg.det(R_proj) < 0:
+                U[:, -1] *= -1
+                R_proj = U @ Vt
+            mean_rot = Rotation.from_matrix(R_proj).as_rotvec()
+            mean_blocks.append(np.concatenate([mean_trans, mean_rot]))
 
-        return np.concatenate([mean_trans, mean_rot])
+        return np.concatenate(mean_blocks)

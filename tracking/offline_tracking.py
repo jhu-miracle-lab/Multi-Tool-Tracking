@@ -298,7 +298,8 @@ def main():
         for arm_name, tr in trackers.items():
             if arm_name not in n_pts_by_arm:
                 continue
-            label = f" [{tr._last_state_label}]" if tr._last_state_label else ""
+            state_label = getattr(tr, "_last_state_label", "")
+            label = f" [{state_label}]" if state_label else ""
             statuses.append(f"{arm_name}: pts={n_pts_by_arm[arm_name]}{label}")
 
             if args.save_states:
