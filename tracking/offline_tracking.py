@@ -25,6 +25,7 @@ sys.path.insert(0, ROOT)
 
 from tracking import (
     ArmTracker,
+    CombinedArmTracker,
     JointTracker,
     SimpleProjector,
     bidirectional_keypoint_coverage,
@@ -80,8 +81,15 @@ def main():
     )
     args = parser.parse_args()
     np.random.seed(args.seed)
+    use_combined = os.environ.get("MTT_ONE_PF_METHOD3", "0") == "1"
     if args.joint and args.relative_to:
         sys.exit("--joint and --relative_to are mutually exclusive")
+    if use_combined and (args.joint or args.relative_to):
+        sys.exit(
+            "MTT_ONE_PF_METHOD3=1 is mutually exclusive with --joint and "
+            "--relative_to; Method 3/4 manages its relative anchor inside "
+            "CombinedArmTracker"
+        )
 
     data_dir = args.data
     left_img_dir = os.path.join(data_dir, "regular", "image", "left_resized")
@@ -154,6 +162,7 @@ def main():
             robot_file,
             n_particles=args.n_particles,
             shaft_params=shaft_params,
+            own_pf=not use_combined,
         )
         trackers[arm_name].detection_noise = noise
         trackers[arm_name].noise_peers = trackers
@@ -180,6 +189,7 @@ def main():
     # known fixed b1_T_b2 base-to-base transform, instead of independent
     # per-arm filters.
     joint_tracker = None
+    combined_tracker = None
     if args.joint:
         if "psm1" not in trackers or "psm2" not in trackers:
             sys.exit(f"--joint requires both 'psm1' and 'psm2' trackers, got {list(trackers)}")
@@ -198,6 +208,15 @@ def main():
         joint_tracker = JointTracker(
             trackers["psm1"], trackers["psm2"], b1_T_b2, n_particles=args.n_particles
         )
+    elif use_combined:
+        if "psm1" not in trackers or "psm2" not in trackers:
+            sys.exit(
+                "MTT_ONE_PF_METHOD3=1 requires both psm1 and psm2, got "
+                f"{list(trackers)}"
+            )
+        combined_tracker = CombinedArmTracker(
+            trackers, n_particles=args.n_particles
+        )
 
     # Warm-up
     warmup_n = min(50, len(frame_indices))
@@ -205,6 +224,11 @@ def main():
         print(f"Warm-up: {warmup_n} frames...")
         if joint_tracker is not None:
             joint_tracker.warmup(frame_indices[:warmup_n], lkl_thresh=0.05, left_img_dir=left_img_dir)
+        elif combined_tracker is not None:
+            combined_tracker.warmup(
+                frame_indices[:warmup_n], lkl_thresh=0.05,
+                left_img_dir=left_img_dir
+            )
         else:
             for tr in trackers.values():
                 tr.warmup(frame_indices[:warmup_n], lkl_thresh=0.05, left_img_dir=left_img_dir)
@@ -252,6 +276,16 @@ def main():
                 continue
             joint_tracker.draw(vis_l, corrected_by_arm)
             n_pts_by_arm = joint_tracker.last_n_dets
+        elif combined_tracker is not None:
+            corrected_by_arm = combined_tracker.update(
+                frame_idx, left_img=left_img
+            )
+            n_pts_by_arm = {}
+            for arm_name, (corrected, n_pts, _) in corrected_by_arm.items():
+                if corrected is None:
+                    continue
+                trackers[arm_name].draw(vis_l, corrected)
+                n_pts_by_arm[arm_name] = n_pts
         else:
             n_pts_by_arm = {}
             for arm_name, tr in trackers.items():
