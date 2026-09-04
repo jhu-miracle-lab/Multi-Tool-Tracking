@@ -54,6 +54,17 @@ LUMPED_N_POINTS = 7  # total point slots: yaw_1, yaw_2, roll_1, roll_2, pitch_1,
 # state = [dtx, dty, dtz, drx, dry, drz]; zero vector = identity = FK exactly correct
 DELTA_PROCESS_STD = np.array([5e-4, 5e-4, 5e-4, 5e-3, 5e-3, 5e-3])
 
+SYNTHETIC_OBS_LIKELIHOOD = 0.10
+SYNTHETIC_OBS_DECAY_TAU = 30.0
+SYNTHETIC_OBS_EDGE_WEIGHT = 1.0
+
+SHAFT_TRANSLATION_DAMPING = 0.25
+SHAFT_CORRECTION_MAX_COND = 1.0e4
+SHAFT_CORRECTION_MAX_MM = 0.010
+
+BLIND_PROCESS_STD_GROWTH_RATE = 0.10
+BLIND_PROCESS_STD_MAX_MULTIPLIER = 3.0
+
 # --- Joint (dual-arm) optimization mode ---
 # state = [dtx, dty, dtz, drx, dry, drz], shared by both arms via a fixed
 # known b1_T_b2 base-to-base transform (see tracking/joint_tracker.py).
