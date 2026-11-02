@@ -50,8 +50,6 @@ class ArmFeatureDetector:
         self.last_raw_hough = None
         self.ema_lines = None
         self.prev_final_global = None
-        self.last_roi_bounds = None
-        self.last_roi_source = "none"
 
     assign_labels = staticmethod(assign_labels)
 
@@ -88,19 +86,14 @@ class ArmFeatureDetector:
 
     def detect(self, frame_idx, left_img, right_img, raw_l, raw_r, **context):
         detector_context = {k: v for k, v in context.items()
-                            if k not in ("detection_noise", "noise_peers", "shaft_dir_b",
-                                         "prior_points_px", "fallback_keypoints")}
+                            if k not in ("shaft_dir_b", "fallback_keypoints")}
         corrected, base_dets = self.detect_keypoints(
             frame_idx, left_img, right_img, raw_l, raw_r, **detector_context)
         if self.shaft_params is not None and left_img is not None and SHAFT_USE_HOUGH:
-            self.detect_shaft(left_img, corrected, frame_idx=frame_idx,
-                              noise=context.get("detection_noise"),
-                              noise_peers=context.get("noise_peers"),
+            self.detect_shaft(left_img, corrected,
                               shaft_dir_b=context.get("shaft_dir_b"),
                               cam_T_b_kin=context.get("cam_T_b_kin"), K=context.get("K"),
-                              prior_points_px=(context.get("prior_points_px")
-                                  if context.get("prior_points_px") is not None else
-                                  [v[:2] for v in (context.get("fallback_keypoints") or {}).values()]))
+                              fallback_keypoints=context.get("fallback_keypoints"))
         else:
             self.last_detected_segs = []
             self.last_raw_hough = None
@@ -139,52 +132,33 @@ class ArmFeatureDetector:
                 segs.append(seg)
         return segs if len(segs) == 2 else []
 
-    def detect_shaft(self, left_img: np.ndarray, corrected: dict, frame_idx=None, noise=None,
-                     noise_peers=None, shaft_dir_b=None, cam_T_b_kin=None, K=None,
-                     prior_points_px=None):
+    def detect_shaft(self, left_img: np.ndarray, corrected: dict,
+                     shaft_dir_b=None, cam_T_b_kin=None, K=None,
+                     fallback_keypoints=None):
         """Detect shaft edges with the shared Canny+HoughLines pipeline
         (tracking/canny_hough.py) and store the result in
-        _last_detected_segs / _last_raw_hough.
+        last_detected_segs / last_raw_hough.
 
         Uses the exact same process()/get_roi() as test_canny_hough.py's
         interactive tuner, so self.shaft_params (loaded from a dataset's
-        canny_params_{arm}.json, or _SHAFT_CANNY_PARAMS as a fallback)
+        canny_params_{arm}.json, or DEFAULT_SHAFT_PARAMS as a fallback)
         actually takes effect here instead of a separately hand-ported
         approximation drifting out of sync with the tuner.
         """
-        p = dict(self.shaft_params)
+        p = self.shaft_params
         H, W = left_img.shape[:2]
 
-        # The horizontal ROI remains anchored at the image edge toward which
-        # this arm's shaft extends. A keypoint, or the prior-particle
-        # projection when all keypoints are absent, determines its y centre.
-        if corrected:
-            best = max(corrected.values(), key=lambda v: v[2])
+        # Use the strongest detection, or the prior pose projection when
+        # detections are missing. Projected points only position the ROI.
+        roi_source = corrected or fallback_keypoints
+        if roi_source:
+            best = max(roi_source.values(), key=lambda v: v[2])
             tx, ty = int(round(best[0])), int(round(best[1]))
-            self.last_roi_source = "keypoint"
         else:
-            points = np.asarray(prior_points_px, dtype=np.float64)
-            if points.ndim != 2 or points.shape[1] != 2:
-                points = np.empty((0, 2), dtype=np.float64)
-            points = points[np.all(np.isfinite(points), axis=1)]
-            points = points[(points[:, 1] >= -H / 2) & (points[:, 1] <= 1.5 * H)]
-            if len(points) == 0:
-                self.last_roi_source = "none"
-                self.last_roi_bounds = None
-                self.last_detected_segs = self._ema_segs_from_lines(0, 0, H, W)
-                self.last_raw_hough = None
-                return
-            centre = np.median(points, axis=0)
-            tx = int(np.clip(round(centre[0]), 0, W - 1))
-            ty = int(round(centre[1]))
-            y_lo, y_hi = np.percentile(points[:, 1], [5.0, 95.0])
-            required_half_height = max(ty - y_lo, y_hi - ty) + 20.0
-            adaptive_pad = int(np.ceil(required_half_height / 1.5))
-            p["roi_pad"] = min(max(p["roi_pad"], adaptive_pad),
-                               max(p["roi_pad"], int(np.ceil(H / 3))))
-            self.last_roi_source = "prior_particles"
+            self.last_detected_segs = self._ema_segs_from_lines(0, 0, H, W)
+            self.last_raw_hough = None
+            return
         if not (0 <= tx < W and 0 <= ty < H):
-            self.last_roi_bounds = None
             self.last_detected_segs = self._ema_segs_from_lines(0, 0, H, W)
             self.last_raw_hough = None
             return
@@ -193,7 +167,6 @@ class ArmFeatureDetector:
             left_img, (tx, ty), p["roi_pad"], self.name, H, W, p.get("edge_margin", 0)
         )
         h_roi, w_roi = roi.shape[:2]
-        self.last_roi_bounds = (off_x, off_y, off_x + w_roi, off_y + h_roi)
 
         if roi.size == 0:
             self.last_detected_segs = self._ema_segs_from_lines(off_x, off_y, h_roi, w_roi)
@@ -249,20 +222,6 @@ class ArmFeatureDetector:
             (theta, rho - (W / 2) * np.cos(theta) - (H / 2) * np.sin(theta))
             for rho, theta in full_lines
         ]
-        noise = noise
-        frame_idx = frame_idx
-        if (self.name == "psm2" and noise is not None
-                and noise.get("kind") == "shaft_swap"
-                and frame_idx in noise.get("frames", set())):
-            primary = (noise_peers or {}).get("psm1")
-            if primary is not None and primary.feature_detector.last_raw_hough:
-                self.last_raw_hough = list(primary.feature_detector.last_raw_hough)
-        if (self.name == "psm2" and noise is not None
-                and noise.get("kind") in ("compound_blackout", "compound_drop")
-                and frame_idx in noise.get("frames", set())):
-            self.last_raw_hough = None
-            self.last_detected_segs = []
-
         # EMA update (drawing / dropout-fallback only, not fed to the PF likelihood)
         a = SHAFT_EDGE_EMA_ALPHA
         if self.ema_lines is None:
@@ -276,11 +235,5 @@ class ArmFeatureDetector:
                 smoothed.append(((1 - a) * re + a * rn, (1 - a) * te + a * tn))
             self.ema_lines = smoothed
 
-        # Convert smoothed Hough lines back to segments for obs model
-        segs = []
-        H_full, W_full = left_img.shape[:2]
-        for rho, theta in self.ema_lines:
-            seg = self._hough_to_seg(rho, theta, H_full, W_full)
-            if seg is not None:
-                segs.append(seg)
-        self.last_detected_segs = segs if len(segs) == 2 else []
+        # Smoothed edges are for display only; likelihoods use last_raw_hough.
+        self.last_detected_segs = self._ema_segs_from_lines(0, 0, H, W)

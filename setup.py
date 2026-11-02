@@ -7,7 +7,7 @@ package_name = 'surgical_tool_tracking_ros2'
 setup(
     name=package_name,
     version='0.1.0',
-    packages=find_packages(include=['tracking', 'tracking.*', 'core', 'core.*', 'ros2_node', 'ros2_node.*']),
+    packages=find_packages(include=['tracking', 'tracking.*', 'core', 'core.*', 'ros2_node', 'ros2_node.*', 'FPRT', 'APRT']),
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
@@ -32,6 +32,12 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'fprt_offline = FPRT.offline_tracking:main',
+            'aprt_offline = APRT.offline_tracking:main',
+            'fprt_tracking_node = FPRT.ros_tracking:main',
+            'aprt_tracking_node = APRT.ros_tracking:main',
+            'fprt_offline_node = FPRT.ros_offline:main',
+            'aprt_offline_node = APRT.ros_offline:main',
             'tracking_node = ros2_node.tracking_node:main',
             'offline_node = ros2_node.offline_node:main',
             'dvrk_stereo_publisher = ros2_node.dvrk_stereo_publisher:main',

@@ -54,34 +54,6 @@ LUMPED_N_POINTS = 7  # total point slots: yaw_1, yaw_2, roll_1, roll_2, pitch_1,
 # state = [dtx, dty, dtz, drx, dry, drz]; zero vector = identity = FK exactly correct
 DELTA_PROCESS_STD = np.array([5e-4, 5e-4, 5e-4, 5e-3, 5e-3, 5e-3])
 
-SYNTHETIC_OBS_LIKELIHOOD = 0.10
-SYNTHETIC_OBS_DECAY_TAU = 30.0
-SYNTHETIC_OBS_EDGE_WEIGHT = 1.0
-
-SHAFT_TRANSLATION_DAMPING = 0.25
-SHAFT_CORRECTION_MAX_COND = 1.0e4
-SHAFT_CORRECTION_MAX_MM = 0.010
-
-BLIND_PROCESS_STD_GROWTH_RATE = 0.10
-BLIND_PROCESS_STD_MAX_MULTIPLIER = 3.0
-
-# --- Joint (dual-arm) optimization mode ---
-# state = [dtx, dty, dtz, drx, dry, drz], shared by both arms via a fixed
-# known b1_T_b2 base-to-base transform (see tracking/joint_tracker.py).
-# 2x DELTA_PROCESS_STD -- swept (0.5x-5x) against real keypoint-reprojection
-# error (median/p90 px vs. real DEKR detections, independent of any
-# b1_T_b2/GT-anchor assumption) on dataset 20260718_115614: 2x gave the best
-# psm1 p90 and a modest median improvement on both arms over 1x, while >=3x
-# started making both arms measurably worse (particle cloud too diffuse).
-# This does NOT close the gap to independent per-arm tracking on that
-# dataset -- the dominant error source there is b1_T_b2 itself being off by
-# ~85mm/3.5deg from an independently-solved cross-check (see
-# pf_simulation/compute_b1_t_b2_from_independent_pnp.py); re-tune this
-# constant if/when b1_T_b2 is re-calibrated, since the right process-noise
-# scale depends on how much slack the filter needs to compensate for a
-# possibly-imperfect b1_T_b2.
-JOINT_DELTA_PROCESS_STD = np.array([1e-3, 1e-3, 1e-3, 1e-2, 1e-2, 1e-2])
-
 # --- Canny+Hough shaft edge PF observation ---
 SHAFT_EDGE_EMA_ALPHA = 0.35  # weight of new detection in EMA smoothing (0=frozen,1=raw)
 

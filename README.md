@@ -1,186 +1,90 @@
-# Surgical Tool Tracking (ROS2)
+# Multi-Tool Tracking：共享实现与两个入口
 
-Markerless 6-DoF tracking of da Vinci PSM surgical tool tips from stereo
-endoscope video, fusing robot forward kinematics with 2-D keypoint
-detections (DeepLabCut / DEKR) and Canny+Hough shaft-edge detection inside
-a particle filter. Implements the Lumped-Error observation model of
-Richter et al. 2022, *"Robotic Tool Tracking Under Partially Visible
-Kinematic Chain"*.
+FPRT 和 APRT 共用一套算法代码，入口显式传入 `allow_primary_switch`。选择方法不再依赖符号链接、导入路径或全局配置。
 
-The pipeline runs either as a set of ROS2 nodes (live camera + joint-state
-topics) or as standalone offline scripts over a pre-recorded dataset
-(images + kinematic logs + DLC/DEKR prediction CSVs).
-
-## Contents
-
-- [Feature overview](#feature-overview)
-- [Class architecture](#class-architecture)
-- [Directory layout](#directory-layout)
-- [Usage](#usage)
-
-## Feature overview
-
-### 1. Forward kinematics & pose math (`core/`)
-Camera- and ROS2-independent math shared by everything else:
-- DH-parameter forward kinematics for a PSM-style tool, including gripper
-  jaw geometry (`core/RobotLink.py`).
-- A generic particle filter with both a scalar (loop-based) API and a
-  vectorised predict/update API, stratified resampling, and an SO(3)-aware
-  weighted-mean pose estimate (`core/ParticleFilter.py`).
-- Pose/rotation conversions (axis-angle ↔ rotation matrix, pose ↔
-  homogeneous transform) and an HSV colour-segmentation helper
-  (`core/utils.py`, `core/probability_functions.py`).
-- Full stereo camera calibration loading + undistort/rectify (used for
-  offline calibration/rectification work, independent of the lighter-weight
-  `SimpleProjector` used by the live tracker) (`core/StereoCamera.py`).
-
-### 2. Per-arm tracking pipeline (`tracking/`)
-The core tracking logic, reused by both the offline script and the ROS2
-nodes:
-- Loads per-arm runtime configuration (kinematics directory, hand-eye
-  calibration file, process noise, keypoint label remap) via
-  `build_arm_configs()`.
-- Reads joint angles either from recorded JSON logs (offline) or live
-  `sensor_msgs/JointState` messages (ROS2) (`tracking/kinematics.py`).
-- Loads pre-computed DeepLabCut keypoint predictions from CSV
-  (`tracking/dlc_csv.py`) or runs DLC inference live on GPU
-  (`tracking/dlc_runner.py`).
-- Resolves keypoint identity ambiguity every frame — which face (left/
-  right, front/back) is visible, and which of the two yaw-tip keypoints is
-  which — via stereo triangulation with a face-normal fallback, plus a 2×2
-  optimal match for the yaw tips (`tracking/label_assignment.py`).
-- Detects the tool shaft's two edges in the image with a shared
-  Canny+HoughLines detector, angle-restricted by the FK-predicted shaft
-  direction (`tracking/canny_hough.py`).
-- Fuses keypoint and shaft-edge observations into one vectorised
-  per-particle log-likelihood (the Lumped-Error model)
-  (`tracking/observation.py`, `tracking/shaft_edge.py`).
-- Orchestrates all of the above per arm, per frame, in `ArmTracker`
-  (`tracking/arm_tracker.py`).
-- A standalone CLI (`tracking/offline_tracking.py`) runs the full pipeline
-  over a recorded dataset without ROS2.
-
-### 3. ROS2 nodes (`ros2_node/`, `launch/`)
-- `tracking_node.py`: live dual-arm tracking from a camera topic and
-  per-arm joint-state topics; publishes tracked pose and an annotated
-  visualization image.
-- `offline_node.py`: the same offline dataset pipeline as
-  `tracking/offline_tracking.py`, wrapped as a ROS2 node that publishes
-  results as topics (useful for replaying a dataset through RViz/rosbag
-  tooling).
-- `launch/tracking.launch.py`: launch file for `tracking_node` with
-  configurable arms, particle count, and topic names.
-
-### 4. Shaft-edge detector tuning (`edge_detection/`)
-Standalone tools for developing the Canny+Hough shaft-edge detector used
-by `tracking/canny_hough.py`:
-- `test_canny_hough.py`: interactive OpenCV trackbar tuner; step through
-  dataset frames and save tuned parameters to `canny_params_{arm}.json`,
-  which `ArmTracker`/`offline_tracking.py` pick up automatically.
-- `render_canny_edges_video.py`: non-interactive batch renderer that
-  produces a detection-result video from a saved parameter file, for one
-  or both arms.
-
-### 5. Keypoint model utilities (`keypoints/`)
-Utilities around the DEKR/DLC keypoint models, independent of the
-tracking runtime:
-- `generate_dekr4_predictions.py`: batch-runs a trained dual-tool DEKR
-  model over a dataset's image folders and writes per-tool prediction CSVs.
-- `split_dlc_csv_by_tool.py`: splits a multi-animal DLC CSV into separate
-  single-tool CSVs.
-- `visualize_dekr.py`: overlays DEKR keypoint predictions and skeleton
-  lines on the source frames and renders an MP4.
-
-### 6. Shared parameters (`Parameter/`)
-Robot DH parameters (`LND.json`) and stereo camera intrinsics
-(`intrinsics.npz`) used by every pipeline above.
-
-## Class architecture
-
-```
-core/
-  RobotLink            Forward kinematics: joint angles -> 3-D point/shaft/
-                        skeleton features in the robot base frame.
-  ParticleFilter        Generic particle filter (scalar + vectorised API).
-  StereoCamera          Stereo calibration load + undistort/rectify + project.
-
-tracking/
-  SimpleProjector        Lightweight camera-frame -> pixel projector (.npz
-  (stereo.py)             intrinsics), with/without lens distortion.
-  DLCRunner               Wraps a DeepLabCut PyTorch pose model for live
-  (dlc_runner.py)         single-frame inference.
-  ArmTracker              Ties one arm's RobotLink + ParticleFilter +
-  (arm_tracker.py)        label assignment + shaft detection + observation
-                          model together. Public API: update(), warmup(),
-                          draw().
-
-ros2_node/
-  DualArmTrackingNode     ROS2 Node: camera/joint-state subscriptions ->
-  (tracking_node.py)      DLCRunner + ArmTracker per arm -> pose/vis publish.
-  OfflineTrackingNode     ROS2 Node: same as tracking/offline_tracking.py,
-  (offline_node.py)       publishing results as topics instead of only
-                          writing to disk.
-
-edge_detection/
-  ArmState                Per-arm loaded config/DLC/FK state used by the
-  (render_canny_edges_video.py)  batch shaft-edge-detection video renderer.
+```text
+project_code/
+├── tracking/                 # 共享跟踪实现
+│   ├── frame.py              # ArmObservation、ArmFrame
+│   ├── arm_tracker.py        # 单臂几何、观测、预热、位姿与绘图
+│   ├── primary_selector.py   # 独立的可靠度迟滞状态机
+│   ├── combined_tracker.py   # 共享 PF、粒子重锚定与累计相对更新
+│   ├── offline_session.py    # 数据加载、预热、绘图及状态保存
+│   └── offline_tracking.py   # 共用命令行流程，直接运行默认 FPRT
+├── ros2_node/                # ROS 适配层
+├── FPRT/                     # config.py 与三个启动脚本
+├── APRT/                     # config.py 与三个启动脚本
+├── core/                     # 原有 PF/机器人基础实现，内容未改
+├── Parameter/、models/       # 共用标定、几何与检测模型资源
+├── keypoints/、edge_detection/ # 数据准备及检测辅助脚本
+├── launch/                   # 共用 ROS launch 文件
+└── setup.py                  # 从此目录构建 ROS 包
 ```
 
-`ArmTracker` is the composition root: it owns a `RobotLink` (kinematics),
-a `ParticleFilter` (state estimation), a `SimpleProjector` (projection),
-and calls into the free functions of `label_assignment.py`,
-`canny_hough.py`, and `observation.py`/`shaft_edge.py` each frame. Both
-`DualArmTrackingNode` and `tracking/offline_tracking.py`'s `main()`
-construct one `ArmTracker` per configured arm and drive it frame by frame
-— the only difference is where the frame/joint-angle data comes from
-(a ROS2 topic vs. a file on disk).
+## 启动
 
-## Directory layout
-
-```
-core/            Camera- and ROS2-independent math (kinematics, PF, stereo calib).
-tracking/        Tracking pipeline: config, detection fusion, ArmTracker, offline CLI.
-ros2_node/       ROS2 node wrappers around the tracking pipeline.
-launch/          ROS2 launch files.
-edge_detection/  Interactive tuner + batch renderer for the shaft-edge detector.
-keypoints/       DEKR/DLC prediction generation, splitting, and visualization tools.
-Parameter/       Shared robot DH parameters and stereo intrinsics.
-```
-
-## Usage
-
-### Offline (no ROS2)
+在已配置依赖的 tracking Python 环境中，从 `project_code/` 执行：
 
 ```bash
-python3 tracking/offline_tracking.py \
-    --data /path/to/dataset \
-    [--handeye /path/to/pnp_handeye.yaml] \
-    [--n_particles 500] \
-    [--no_display]
+python FPRT/offline_tracking.py --data /path/to/dataset --no_display
+python APRT/offline_tracking.py --data /path/to/dataset --no_display
 ```
 
-Expects a dataset laid out as `regular/image/{left,right}_resized/` (PNG
-frames + DLC prediction CSVs) and `regular/kinematic/{PSM1,PSM2}/` (per-frame
-joint-angle JSON). Writes an annotated video and per-frame PNGs to
-`tracking_output_offline/`.
+两个入口都支持 `--handeye`、`--n_particles`、`--out_dir`、`--save_states`。默认输出分别位于 `FPRT/tracking_output_offline/` 和 `APRT/tracking_output_offline/`。
 
-### ROS2
+从代码创建时显式选择方法；两种方法可同时存在于同一 Python 进程：
+
+```python
+fixed = CombinedArmTracker(arms, 500, allow_primary_switch=False)
+auto = CombinedArmTracker(other_arms, 500, allow_primary_switch=True)
+```
+
+实例应使用各自的 ArmTracker 对象，因为观测及位姿状态是可变的。
+
+## 数据和职责边界
+
+`ArmTracker.prepare_frame()` 返回 `ArmFrame`；`CombinedArmTracker.update()` 返回 `{arm_name: ArmFrame}`。缺少关节数据时 `frame.available` 为 False；没有视觉检测但关节数据可用时仍是一帧有效数据。
+
+```python
+frames = combined.update(frame_idx, left_img=image)
+frame = frames['psm1']
+if frame.available:
+    tracker.draw(image, frame.corrected_keypoints)
+    count = frame.observation_count
+```
+
+`ArmObservation` 保存关键点、三维点、杆几何、杆边缘和图像尺寸。观测重分配修改其中的 `keypoints`；`observation_count` 保留重分配前的数量，保持原输出含义。
+
+单臂公开接口：`anchor`、`has_relative_anchor`、`set_anchor()`、`warmup_std`、`shaft_radius`、`log_likelihood()`、`finalize_pose()`。`set_anchor()` 只改变几何参考；共享粒子的坐标转换由 CombinedArmTracker 负责。跨臂模块不再直接写单臂私有状态。
+
+PrimarySelector 只维护主臂候选、连续确认次数和驻留时间，不依赖图像、机器人几何或 PF。CombinedArmTracker 根据其返回的主臂执行重锚定与粒子更新。
+
+共享 PF 内部仍调用原 `core/ParticleFilter.py` 接口；本次没有修改 core，也没有改变粒子更新顺序或似然公式。
+
+## ROS
+
+从本目录重新构建并 source 新安装环境。旧 `FPRT/build`、`install`、`log` 已归档至 `../test_code/legacy_ros_build/FPRT/`，不作为新版运行环境。
+
+在 ROS 环境中可直接启动对应脚本：
 
 ```bash
-ros2 launch surgical_tool_tracking_ros2 tracking.launch.py \
-    arms:="['psm1', 'psm2']" n_particles:=300
+python FPRT/ros_tracking.py
+python APRT/ros_tracking.py
+python APRT/ros_offline.py --ros-args -p data:=/path/to/dataset -p no_display:=true
 ```
 
-Subscribes to `/camera/left/image_raw` and each arm's
-`measured_js`/`jaw/measured_js` topics; publishes
-`/tracking/{arm}/pose` and `/tracking/visualization`.
+安装后的 console entries 包含 `fprt_tracking_node`、`aprt_tracking_node`、`fprt_offline_node`、`aprt_offline_node`、`fprt_offline`、`aprt_offline`。原 `tracking_node` / `offline_node` 继续可用，默认 FPRT；通过 ROS 参数 `allow_primary_switch:=true` 选择 APRT。两个 launch 文件也接受该参数。
 
-### Tuning the shaft-edge detector
+## 方法与迁移
 
-```bash
-python3 edge_detection/test_canny_hough.py --data /path/to/dataset --arm psm1
-```
+两种入口均使用可靠度门控、关键点重分配、2D 杆观测、重叠降权、模式切换重初始化和累计主臂误差传递。FPRT 只允许第一臂为主臂；APRT 可以选择任一臂。
 
-Adjust sliders interactively, press `p` to save (or `q` to save and quit)
-to `{data}/canny_params_{arm}.json`, which `ArmTracker` loads automatically
-on the next run.
+累计变化为 `G = L_current @ inverse(L_reference)`；参考在进入相对模式或切换主臂时建立。副臂保留自身六维误差状态。
+
+- 旧 `FPRT/tracking/`、`APRT/tracking/` 已由根目录 `tracking/` 取代。
+- 方法配置在 `FPRT/config.py`、`APRT/config.py`；共享数值常量在 `tracking/tracker_config.py`。
+- 原结果元组改为 ArmFrame，外部调用脚本需要按上述字段取值。
+- NPZ 的 `frames`、`ema_states`、`fk_tips` 字段保持不变；`ema_states` 存的是 PF 状态，沿用旧名以兼容读取脚本。
+- 当前 FPRT 也有可靠度门控，与论文中始终处于相对模式的配置有区别。此次为架构重构，未重新评估完整实验精度。
+
+建议阅读顺序：`frame.py` → `offline_session.py` → `arm_tracker.py` → `primary_selector.py` → `combined_tracker.py` → 两类 observation 模块。

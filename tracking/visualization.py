@@ -91,14 +91,30 @@ def draw_hud(img, fps: float, infer_ms: float):
     cv2.putText(img, text, (x, y), font, fs, (255, 255, 255), ft, cv2.LINE_AA)
 
 
-def draw_overlap_hud(img, coverage):
-    """Draw bidirectional keypoint coverage below the performance HUD."""
-    label = "overlap: n/a" if coverage is None else f"overlap: {coverage * 100:.0f}%"
-    color = (255, 255, 255) if coverage in (None, 0.0) else (0, 0, 255)
+def draw_main_tool_hud(img, primary_name, overlap_px, trigger_px=None, coverage=None):
+    """Overlay "main tool: <name/independent>  |  overlap: Npx" as a second
+    status line in the top-right corner, just below draw_hud()'s fps line.
+
+    primary_name: CombinedArmTracker.last_relative_main, or None in joint mode.
+    overlap_px: minimum projected keypoint separation, or None if unavailable.
+    trigger_px: optional display-only warning threshold. It does not control
+                the tracker's reliability gate or primary selection.
+    """
+    primary_label = primary_name if primary_name else "independent"
+    if overlap_px is None:
+        overlap_label = "overlap: n/a"
+        color = (255, 255, 255)
+    else:
+        overlap_label = f"overlap: {overlap_px:.0f}px"
+        at_risk = trigger_px is not None and overlap_px < trigger_px
+        color = (0, 0, 255) if at_risk else (255, 255, 255)  # BGR red vs white
+
+    coverage_label = "coverage: n/a" if coverage is None else f"coverage: {coverage * 100:.0f}%"
+    text = f"main tool: {primary_label}  |  {overlap_label}  |  {coverage_label}"
     font = cv2.FONT_HERSHEY_SIMPLEX
     fs, ft = 0.55, 2
-    (tw, th), _ = cv2.getTextSize(label, font, fs, ft)
+    (tw, th), _ = cv2.getTextSize(text, font, fs, ft)
     x = img.shape[1] - tw - 10
-    y = th + 40
-    cv2.putText(img, label, (x, y), font, fs, (0, 0, 0), ft + 2, cv2.LINE_AA)
-    cv2.putText(img, label, (x, y), font, fs, color, ft, cv2.LINE_AA)
+    y = th + 12 + 28  # one line below draw_hud()'s fps/infer-ms line
+    cv2.putText(img, text, (x, y), font, fs, (0, 0, 0), ft + 2, cv2.LINE_AA)
+    cv2.putText(img, text, (x, y), font, fs, color, ft, cv2.LINE_AA)

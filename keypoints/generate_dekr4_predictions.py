@@ -28,12 +28,12 @@ from deeplabcut.core.config import read_config_as_dict
 from deeplabcut.pose_estimation_pytorch.apis import get_pose_inference_runner
 
 DEKR4_CFG = (
-    "/media/joec/data/Deeplabcut/DualTool-DEKR-Mackenzie-2026-05-27"
+    "/media/joec/data/Multi-Tool-Tracking-Project/01-code/Deeplabcut/DualTool-DEKR-Mackenzie-2026-05-27"
     "/dlc-models-pytorch/iteration-0/DualTool-DEKRMay27-trainset80shuffle4"
     "/train/pytorch_config.yaml"
 )
 DEKR4_SNAP = (
-    "/media/joec/data/Deeplabcut/DualTool-DEKR-Mackenzie-2026-05-27"
+    "/media/joec/data/Multi-Tool-Tracking-Project/01-code/Deeplabcut/DualTool-DEKR-Mackenzie-2026-05-27"
     "/dlc-models-pytorch/iteration-0/DualTool-DEKRMay27-trainset80shuffle4"
     "/train/snapshot-best-120.pt"
 )

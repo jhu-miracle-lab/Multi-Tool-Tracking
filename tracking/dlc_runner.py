@@ -7,11 +7,11 @@ from deeplabcut.pose_estimation_pytorch.apis import get_pose_inference_runner
 
 _DLC_ROOT_PSM1 = os.environ.get(
     "DLC_ROOT_PSM1",
-    "/media/joec/data/Deeplabcut/Trained/Reaching-Mackenzie-2026-02-27",
+    "/media/joec/data/Multi-Tool-Tracking-Project/01-code/Deeplabcut/Trained/Reaching-Mackenzie-2026-02-27",
 )
 _DLC_ROOT_PSM2 = os.environ.get(
     "DLC_ROOT_PSM2",
-    "/media/joec/data/Deeplabcut/Reaching-Mackenzie-2026-04-01-tool2only",
+    "/media/joec/data/Multi-Tool-Tracking-Project/01-code/Deeplabcut/Reaching-Mackenzie-2026-04-01-tool2only",
 )
 
 ARM_MODEL_CONFIGS = {

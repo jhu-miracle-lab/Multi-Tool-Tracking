@@ -22,8 +22,11 @@ Publishes:
 
 Parameters:
   ~arms            [psm1, psm2]   arms to track
-  ~n_particles     300            number of particles
+  ~n_particles     300            number of particles (all arms share ONE
+                                  6*n_arms-state filter, see
+                                  tracking/combined_tracker.py)
   ~warmup_frames   0              frames to collect for PF warm-up at startup (0=skip)
+  ~overlap_trigger_px 80.0        display-only overlap warning threshold
   ~image_topic     /camera/left/image_raw
   ~right_image_topic  /camera/right/image_raw
   ~dekr_model_path ""             DEKR live model path override (default: DekrLiveRunner's
@@ -86,7 +89,15 @@ def _resolve_src_dir() -> str:
 SRC_DIR = _resolve_src_dir()
 sys.path.insert(0, SRC_DIR)
 
-from tracking import ArmTracker, SimpleProjector, draw_legend, draw_hud
+from tracking import (
+    ArmTracker,
+    CombinedArmTracker,
+    SimpleProjector,
+    draw_legend,
+    draw_hud,
+    draw_main_tool_hud,
+    wrist_overlap,
+)
 from tracking.arm_configs import build_arm_configs
 from tracking.constants import DLC_W, DLC_H, CAL_W, CAL_H, DEKR_BODYPARTS, DEKR_ARM_ORDER
 from tracking.label_assignment import instance_to_dets, remap_labels
@@ -108,40 +119,21 @@ _SENSOR_QOS = QoSProfile(
 )
 
 
-def _pose_to_stamped(cam_T_b: np.ndarray, stamp, frame_id: str) -> PoseStamped:
-    """Convert a 4x4 cam_T_b matrix into a PoseStamped (robot base pose in the camera frame)."""
-    msg = PoseStamped()
-    msg.header.stamp = stamp
-    msg.header.frame_id = frame_id
-    R = cam_T_b[:3, :3]
-    t = cam_T_b[:3, 3]
-    rvec, _ = cv2.Rodrigues(R)
-    angle = float(np.linalg.norm(rvec))
-    if angle > 1e-9:
-        axis = rvec.flatten() / angle
-    else:
-        axis = np.array([0.0, 0.0, 1.0])
-    # axis-angle → quaternion
-    s = np.sin(angle / 2)
-    msg.pose.orientation.x = float(axis[0] * s)
-    msg.pose.orientation.y = float(axis[1] * s)
-    msg.pose.orientation.z = float(axis[2] * s)
-    msg.pose.orientation.w = float(np.cos(angle / 2))
-    msg.pose.position.x = float(t[0])
-    msg.pose.position.y = float(t[1])
-    msg.pose.position.z = float(t[2])
-    return msg
+from ros2_node.pose_messages import pose_to_stamped
 
 
 class DualArmTrackingNode(Node):
 
-    def __init__(self):
+    def __init__(self, *, allow_primary_switch=False):
         super().__init__("dual_arm_tracking")
 
         # --- Parameters ---
         self.declare_parameter("arms", ["psm1", "psm2"])
+        self.declare_parameter("allow_primary_switch", allow_primary_switch)
         self.declare_parameter("n_particles", 300)
         self.declare_parameter("warmup_frames", 0)
+        # Primary selection is passed explicitly by the entry or ROS parameter.
+        self.declare_parameter("overlap_trigger_px", 80.0)
         self.declare_parameter("image_topic", "/camera/left/image_raw")
         self.declare_parameter("right_image_topic", "/camera/right/image_raw")
         self.declare_parameter("camera_frame", "left_camera_optical_frame")
@@ -162,6 +154,7 @@ class DualArmTrackingNode(Node):
 
         arms = self.get_parameter("arms").value
         n_particles = self.get_parameter("n_particles").value
+        overlap_trigger_px = self.get_parameter("overlap_trigger_px").value
         self._warmup_frames_needed = self.get_parameter("warmup_frames").value
         image_topic = self.get_parameter("image_topic").value
         right_image_topic = self.get_parameter("right_image_topic").value
@@ -224,9 +217,16 @@ class DualArmTrackingNode(Node):
                 dist_l,
                 projector,
                 robot_file,
-                n_particles=n_particles,
             )
             self.get_logger().info(f"[{arm_name}] tracker ready")
+
+        self._combined = CombinedArmTracker(
+            self._trackers, n_particles,
+            allow_primary_switch=self.get_parameter("allow_primary_switch").value)
+
+        self._K_dlc = K_dlc
+        self._dist_l = dist_l
+        self._overlap_trigger_px = overlap_trigger_px
 
         # --- Joint angle cache (thread-safe) ---
         # {arm_name: (js_msg, jaw_msg)}
@@ -297,10 +297,10 @@ class DualArmTrackingNode(Node):
         except Exception as e:
             self.get_logger().error(f"cv_bridge error (right): {e}")
 
-    def _publish_vis(self, vis: np.ndarray, header, show_hud: bool = False):
-        """Draw the perf HUD (when show_hud) + legend, publish to
-        /tracking/visualization, and (if enabled) show it in a local
-        OpenCV preview window, upscaled by display_scale.
+    def _publish_vis(self, vis: np.ndarray, header, show_hud: bool = False, overlap_px=None):
+        """Draw the perf HUD (when show_hud) + legend + main-tool/overlap
+        status, publish to /tracking/visualization, and (if enabled) show
+        it in a local OpenCV preview window, upscaled by display_scale.
 
         The published topic always stays at native DLC_W x DLC_H -- only
         the local preview window is upscaled (cv2.resizeWindow() alone
@@ -310,6 +310,9 @@ class DualArmTrackingNode(Node):
         """
         if show_hud:
             draw_hud(vis, self._fps_smooth, self._infer_ms_smooth)
+            draw_main_tool_hud(
+                vis, self._combined.last_relative_main, overlap_px, trigger_px=self._overlap_trigger_px
+            )
         draw_legend(vis)
         try:
             vis_msg = self._bridge.cv2_to_imgmsg(vis, encoding="bgr8")
@@ -358,7 +361,8 @@ class DualArmTrackingNode(Node):
             self.get_logger().info(
                 f"[{arm_name}] warm-up: {len(per_arm_frames[arm_name])} frames, initializing..."
             )
-            self._trackers[arm_name].warmup_live(per_arm_frames[arm_name])
+        self._combined.warmup_live({a: per_arm_frames[a] for a in ready})
+        for arm_name in ready:
             self._warmup_done[arm_name] = True
 
     def _image_cb(self, img_msg: Image):
@@ -423,7 +427,8 @@ class DualArmTrackingNode(Node):
 
         # --- Main per-frame tracking: one shared DEKR forward pass (its
         # identity head resolves psm1 vs psm2, see class docstring), then
-        # each arm's own PF update. ---
+        # one joint update of the shared 12-state (6 per arm) particle
+        # filter -- see tracking/combined_tracker.py. ---
         if joint_angles_by_arm:
             t0 = time.perf_counter()
             instances_l, instances_r = self._dekr.infer(left_img, right_img)
@@ -437,11 +442,10 @@ class DualArmTrackingNode(Node):
                 self._fps_smooth = 0.9 * self._fps_smooth + 0.1 / max(dt, 1e-6)
             self._t_prev = t_now
 
+            per_arm = {}
             for idx, arm_name in enumerate(DEKR_ARM_ORDER):
                 if arm_name not in joint_angles_by_arm or idx >= len(instances_l):
                     continue
-                joint_angles = joint_angles_by_arm[arm_name]
-                tr = self._trackers[arm_name]
                 remap = self._arm_cfgs[arm_name]["label_remap"]
                 raw_l = remap_labels(instance_to_dets(instances_l[idx], DEKR_BODYPARTS), remap)
                 raw_r = (
@@ -449,28 +453,37 @@ class DualArmTrackingNode(Node):
                     if idx < len(instances_r)
                     else {}
                 )
-
-                corrected, n_pts, _ = tr.update(
-                    left_img=left_img,
-                    right_img=right_img,
-                    joint_angles=joint_angles,
-                    raw_l=raw_l,
-                    raw_r=raw_r,
+                per_arm[arm_name] = dict(
+                    joint_angles=joint_angles_by_arm[arm_name], raw_l=raw_l, raw_r=raw_r
                 )
-                if corrected is None:
-                    continue
 
-                tr.draw(vis, corrected)
+            results = self._combined.update(left_img=left_img, right_img=right_img, per_arm=per_arm)
+
+            for arm_name, frame in results.items():
+                if not frame.available:
+                    continue
+                tr = self._trackers[arm_name]
+                tr.draw(vis, frame.corrected_keypoints)
 
                 # Publish pose
-                pose_msg = _pose_to_stamped(tr.cam_T_b, img_msg.header.stamp, self._cam_frame)
+                pose_msg = pose_to_stamped(tr.cam_T_b, img_msg.header.stamp, self._cam_frame)
                 self._pose_pubs[arm_name].publish(pose_msg)
 
-                self.get_logger().debug(f"[{arm_name}] pts={n_pts}")
+                self.get_logger().debug(f"[{arm_name}] pts={frame.observation_count}")
+
+        overlap_px = None
+        if len(self._trackers) == 2 and self._t_prev is not None:
+            name_a, name_b = list(self._trackers.keys())
+            overlap = wrist_overlap(
+                self._trackers[name_a], self._trackers[name_b], self._K_dlc, self._dist_l
+            )
+            overlap_px = overlap[0] if overlap is not None else None
 
         # show_hud only once real inference has run at least once (self._t_prev
         # is set there) -- otherwise fps/infer_ms are stale/zero and misleading.
-        self._publish_vis(vis, img_msg.header, show_hud=self._t_prev is not None)
+        self._publish_vis(
+            vis, img_msg.header, show_hud=self._t_prev is not None, overlap_px=overlap_px
+        )
 
     def destroy_node(self):
         if self._display:
@@ -478,9 +491,9 @@ class DualArmTrackingNode(Node):
         super().destroy_node()
 
 
-def main(args=None):
+def main(args=None, *, allow_primary_switch=False):
     rclpy.init(args=args)
-    node = DualArmTrackingNode()
+    node = DualArmTrackingNode(allow_primary_switch=allow_primary_switch)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

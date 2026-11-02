@@ -12,6 +12,7 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument("arms", default_value="['psm1', 'psm2']"),
+            DeclareLaunchArgument("allow_primary_switch", default_value="false"),
             DeclareLaunchArgument("n_particles", default_value="300"),
             DeclareLaunchArgument("warmup_frames", default_value="50"),
             DeclareLaunchArgument("left_topic", default_value="/camera/left/image_raw"),
@@ -45,6 +46,7 @@ def generate_launch_description():
                 parameters=[
                     {
                         "arms": LaunchConfiguration("arms"),
+                        "allow_primary_switch": LaunchConfiguration("allow_primary_switch"),
                         "n_particles": LaunchConfiguration("n_particles"),
                         "warmup_frames": LaunchConfiguration("warmup_frames"),
                         "image_topic": LaunchConfiguration("left_topic"),
