@@ -7,7 +7,7 @@ from FPRT.config import ALLOW_PRIMARY_SWITCH
 
 
 def main():
-    from ros2_node.offline_node import main as run
+    from tracking.messages.offline_node import main as run
     return run(allow_primary_switch=ALLOW_PRIMARY_SWITCH)
 
 

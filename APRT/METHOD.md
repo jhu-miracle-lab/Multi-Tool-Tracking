@@ -1,8 +1,8 @@
-# APRT 入口
+# APRT Entry Points
 
-`config.py` 显式设置 `ALLOW_PRIMARY_SWITCH = True`。三个启动脚本调用根目录的共享实现，不再通过符号链接切换算法配置。
+`config.py` explicitly sets `ALLOW_PRIMARY_SWITCH = True`. The three entry scripts call the shared implementation in the project root instead of switching algorithm configurations through symbolic links.
 
-从 `project_code/` 执行：
+Run from `project_code/`:
 
 ```bash
 python APRT/offline_tracking.py --data /path/to/dataset --no_display
@@ -10,6 +10,6 @@ python APRT/ros_tracking.py
 python APRT/ros_offline.py --ros-args -p data:=/path/to/dataset
 ```
 
-配置、算法与接口说明见 [共享项目说明](../README.md)。
+See the [shared project README](../README.md) for configuration, algorithms, and interfaces.
 
-APRT 允许任一臂为主臂，沿用相同可靠度阈值与迟滞规则。
+APRT allows either arm to be primary, using the same reliability thresholds and hysteresis rules.

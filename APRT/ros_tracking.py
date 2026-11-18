@@ -7,7 +7,7 @@ from APRT.config import ALLOW_PRIMARY_SWITCH
 
 
 def main():
-    from ros2_node.tracking_node import main as run
+    from tracking.messages.tracking_node import main as run
     return run(allow_primary_switch=ALLOW_PRIMARY_SWITCH)
 
 

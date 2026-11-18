@@ -1,8 +1,8 @@
-# FPRT 入口
+# FPRT Entry Points
 
-`config.py` 显式设置 `ALLOW_PRIMARY_SWITCH = False`。三个启动脚本调用根目录的共享实现，不再通过符号链接切换算法配置。
+`config.py` explicitly sets `ALLOW_PRIMARY_SWITCH = False`. The three entry scripts call the shared implementation in the project root instead of switching algorithm configurations through symbolic links.
 
-从 `project_code/` 执行：
+Run from `project_code/`:
 
 ```bash
 python FPRT/offline_tracking.py --data /path/to/dataset --no_display
@@ -10,6 +10,6 @@ python FPRT/ros_tracking.py
 python FPRT/ros_offline.py --ros-args -p data:=/path/to/dataset
 ```
 
-配置、算法与接口说明见 [共享项目说明](../README.md)。
+See the [shared project README](../README.md) for configuration, algorithms, and interfaces.
 
-FPRT 只允许第一臂（通常 PSM1）为主臂，仍启用可靠度门控。
+FPRT allows only the first arm (usually PSM1) to be primary, with reliability gating still enabled.

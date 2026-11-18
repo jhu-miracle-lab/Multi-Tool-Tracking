@@ -7,7 +7,7 @@ from FPRT.config import ALLOW_PRIMARY_SWITCH
 
 
 def main():
-    from tracking.offline_tracking import main as run
+    from tracking.messages.offline_tracking import main as run
     return run(allow_primary_switch=ALLOW_PRIMARY_SWITCH)
 
 

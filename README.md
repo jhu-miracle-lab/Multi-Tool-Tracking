@@ -1,90 +1,181 @@
-# Multi-Tool Tracking：共享实现与两个入口
+# Multi-Tool Tracking
 
-FPRT 和 APRT 共用一套算法代码，入口显式传入 `allow_primary_switch`。选择方法不再依赖符号链接、导入路径或全局配置。
+Stereo tracking of two dVRK tools using keypoints, shaft edges, robot kinematics,
+and a shared particle filter. **FPRT** fixes the eligible primary to the first
+arm (normally PSM1); **APRT** allows either arm to become primary. Both use
+reliability gating and cumulative relative tracking.
 
-```text
-project_code/
-├── tracking/                 # 共享跟踪实现
-│   ├── frame.py              # ArmObservation、ArmFrame
-│   ├── arm_tracker.py        # 单臂几何、观测、预热、位姿与绘图
-│   ├── primary_selector.py   # 独立的可靠度迟滞状态机
-│   ├── combined_tracker.py   # 共享 PF、粒子重锚定与累计相对更新
-│   ├── offline_session.py    # 数据加载、预热、绘图及状态保存
-│   └── offline_tracking.py   # 共用命令行流程，直接运行默认 FPRT
-├── ros2_node/                # ROS 适配层
-├── FPRT/                     # config.py 与三个启动脚本
-├── APRT/                     # config.py 与三个启动脚本
-├── core/                     # 原有 PF/机器人基础实现，内容未改
-├── Parameter/、models/       # 共用标定、几何与检测模型资源
-├── keypoints/、edge_detection/ # 数据准备及检测辅助脚本
-├── launch/                   # 共用 ROS launch 文件
-└── setup.py                  # 从此目录构建 ROS 包
+Default pipeline: **raw stereo images → ELSED shaft edges + keypoints → joint PF**.
+
+## Code structure
+
+| Directory | Responsibility |
+| --- | --- |
+| `tracking/messages/` | ROS synchronization, offline data loading, execution, and outputs |
+| `tracking/features/` | Keypoint extraction, per-view state, ROI preparation, and shaft detection |
+| `tracking/pf/` | Robot geometry, observation likelihoods, PF updates, and relative tracking |
+| `tracking/common/` | Stereo calibration, transforms, shared data structures, and visualization |
+| `FPRT/`, `APRT/` | Method settings and offline/ROS entry points |
+| `Parameter/` | Stereo calibration YAML and `LND.json` tool geometry |
+| `launch/` | Tracker launch and combined dVRK camera/tracker launch |
+| `resource/` | ROS package-index marker |
+
+
+
+## Python installation (offline)
+
+Install Conda first. On Ubuntu/Linux, run from the downloaded project directory:
+
+```bash
+sudo apt update
+sudo apt install build-essential pkg-config libopencv-dev pybind11-dev
+conda create -n multi-tool-tracking python=3.10 pip -y
+conda activate multi-tool-tracking
+conda env config vars set PYTHONNOUSERSITE=1 PYTHONPATH=""
+conda deactivate
+conda activate multi-tool-tracking
+which python
+python -m pip --version
+python -m pip install --upgrade pip
+python -m pip install -e .
+python -m pip check
+python FPRT/offline_tracking.py --help
 ```
 
-## 启动
+The environment saves both isolation settings: activation disables user-site
+packages and clears inherited Python paths (including ROS); deactivation restores
+the previous values (originally unset variables may become empty strings, which
+disable these Python overrides). Configure once, then use `conda activate multi-tool-tracking`
+in new terminals. Re-activation is required immediately after saving the settings.
 
-在已配置依赖的 tracking Python 环境中，从 `project_code/` 执行：
+## ROS 2 installation
+
+Install ROS 2 Humble first. Use its system Python in a separate terminal;
+the Conda installation above is not required for this route. Place this package
+under `~/tracking_ws/src/`, then run:
+
+```bash
+# If a Conda environment is active, deactivate it before loading ROS.
+conda deactivate
+# Repeat conda deactivate if another environment (including base) remains active.
+source /opt/ros/humble/setup.bash
+sudo apt install python3-colcon-common-extensions python3-rosdep \
+  python3-dev python3-setuptools python3-wheel build-essential pkg-config pybind11-dev
+# Run sudo rosdep init once if rosdep has never been initialized.
+rosdep update
+cd ~/tracking_ws
+rosdep install --from-paths src --ignore-src -r -y --rosdistro humble
+/usr/bin/python3 -m colcon build --packages-select surgical_tool_tracking_ros2
+source install/setup.bash
+ros2 pkg executables surgical_tool_tracking_ros2
+```
+
+Skip `conda deactivate` if Conda is not installed. Source ROS and the workspace
+in each new terminal; do not clear `PYTHONPATH` after sourcing ROS. Rebuild after
+changing installed launch files, assets, or native code.
+
+## Resources to supply
+
+- **Hand-eye YAML:** use offline `--handeye` or ROS `handeye`. Offline mode also
+  recognizes `<dataset>/pnp_handeye_manual.yaml`. Missing files raise an error.
+- **Offline dataset:** images, joint JSON, and cached keypoint CSVs. No online
+  inference environment is required for cached CSV tracking.
+- **Online inference:** compatible PyTorch/DLCLive dependencies and DEKR weights
+  with the identity head. Set `dekr_model_path` or `DEKR_LIVE_MODEL_PATH`.
+  These dependencies, weights, and GPU drivers are not installed automatically.
+- **Direct dVRK capture:** GStreamer/PyGObject and the `unixfdsrc` plugin;
+  check with `gst-inspect-1.0 unixfdsrc`.
+
+`Parameter/stereo_calibration.yaml` and `LND.json` must match the hardware.
+
+## Offline running
+
+Run from the project directory. Expected dataset layout:
+
+```text
+dataset/
+├── pnp_handeye_manual.yaml
+└── regular/
+    ├── image/
+    │   ├── left_resized/    # 0.png, 1.png, ... and the two CSVs below
+    │   └── right_resized/   # Matching image IDs and CSV names
+    └── kinematic/
+        ├── PSM1/           # 0.json, 1.json, ...
+        └── PSM2/           # 0.json, 1.json, ...
+```
+
+CSV names: `image_predictions_DEKR_shuffle10_best140_tool1.csv` and
+`image_predictions_DEKR_shuffle10_best140_tool2.csv`. Each uses DLC headers with
+`x`, `y`, and `likelihood` columns. Joint JSON format is defined in
+`tracking/messages/kinematics.py`. Image/JSON filenames use unpadded frame IDs;
+matching left/right IDs must refer to the same recording time.
 
 ```bash
 python FPRT/offline_tracking.py --data /path/to/dataset --no_display
-python APRT/offline_tracking.py --data /path/to/dataset --no_display
+python APRT/offline_tracking.py --data /path/to/dataset --no_display \
+  --handeye /path/to/handeye.yaml --n_particles 500 \
+  --out_dir ./results/aprt
 ```
 
-两个入口都支持 `--handeye`、`--n_particles`、`--out_dir`、`--save_states`。默认输出分别位于 `FPRT/tracking_output_offline/` 和 `APRT/tracking_output_offline/`。
+Offline defaults are 500 particles and up to 50 warmup frames. Select the
+optional Canny/Hough backend with `--shaft_backend canny_hough`. Historical line
+selection remains enabled; failed detections may retain the previous display
+line, but do not reuse it as a fresh PF edge observation. Optional dataset
+files `shaft_params_psm1.json` and `shaft_params_psm2.json` override defaults in
+`tracking/features/shaft_config.py`; legacy `canny_params_<arm>.json` is supported.
 
-从代码创建时显式选择方法；两种方法可同时存在于同一 Python 进程：
+## ROS running
 
-```python
-fixed = CombinedArmTracker(arms, 500, allow_primary_switch=False)
-auto = CombinedArmTracker(other_arms, 500, allow_primary_switch=True)
-```
-
-实例应使用各自的 ArmTracker 对象，因为观测及位姿状态是可变的。
-
-## 数据和职责边界
-
-`ArmTracker.prepare_frame()` 返回 `ArmFrame`；`CombinedArmTracker.update()` 返回 `{arm_name: ArmFrame}`。缺少关节数据时 `frame.available` 为 False；没有视觉检测但关节数据可用时仍是一帧有效数据。
-
-```python
-frames = combined.update(frame_idx, left_img=image)
-frame = frames['psm1']
-if frame.available:
-    tracker.draw(image, frame.corrected_keypoints)
-    count = frame.observation_count
-```
-
-`ArmObservation` 保存关键点、三维点、杆几何、杆边缘和图像尺寸。观测重分配修改其中的 `keypoints`；`observation_count` 保留重分配前的数量，保持原输出含义。
-
-单臂公开接口：`anchor`、`has_relative_anchor`、`set_anchor()`、`warmup_std`、`shaft_radius`、`log_likelihood()`、`finalize_pose()`。`set_anchor()` 只改变几何参考；共享粒子的坐标转换由 CombinedArmTracker 负责。跨臂模块不再直接写单臂私有状态。
-
-PrimarySelector 只维护主臂候选、连续确认次数和驻留时间，不依赖图像、机器人几何或 PF。CombinedArmTracker 根据其返回的主臂执行重锚定与粒子更新。
-
-共享 PF 内部仍调用原 `core/ParticleFilter.py` 接口；本次没有修改 core，也没有改变粒子更新顺序或似然公式。
-
-## ROS
-
-从本目录重新构建并 source 新安装环境。旧 `FPRT/build`、`install`、`log` 已归档至 `../test_code/legacy_ros_build/FPRT/`，不作为新版运行环境。
-
-在 ROS 环境中可直接启动对应脚本：
+With existing raw stereo image publishers:
 
 ```bash
-python FPRT/ros_tracking.py
-python APRT/ros_tracking.py
-python APRT/ros_offline.py --ros-args -p data:=/path/to/dataset -p no_display:=true
+export DEKR_LIVE_MODEL_PATH=/path/to/model_ident.pt
+ros2 launch surgical_tool_tracking_ros2 tracking.launch.py \
+  handeye:=/path/to/handeye.yaml \
+  image_topic:=/camera/left/image_raw \
+  right_image_topic:=/camera/right/image_raw \
+  allow_primary_switch:=false
 ```
 
-安装后的 console entries 包含 `fprt_tracking_node`、`aprt_tracking_node`、`fprt_offline_node`、`aprt_offline_node`、`fprt_offline`、`aprt_offline`。原 `tracking_node` / `offline_node` 继续可用，默认 FPRT；通过 ROS 参数 `allow_primary_switch:=true` 选择 APRT。两个 launch 文件也接受该参数。
+Set `allow_primary_switch:=true` for APRT. Launch defaults are 300 particles and
+50 warmup frames. Both launch files default to ELSED; use
+`shaft_backend:=canny_hough` to switch. Direct nodes accept
+`-p shaft_backend:=canny_hough`. For additional parameters, including headless operation:
 
-## 方法与迁移
+```bash
+ros2 run surgical_tool_tracking_ros2 aprt_tracking_node --ros-args \
+  -p handeye:=/path/to/handeye.yaml -p dekr_model_path:=/path/to/model_ident.pt \
+  -p warmup_frames:=50 -p no_display:=true
+```
 
-两种入口均使用可靠度门控、关键点重分配、2D 杆观测、重叠降权、模式切换重初始化和累计主臂误差传递。FPRT 只允许第一臂为主臂；APRT 可以选择任一臂。
+Use `fprt_tracking_node` for FPRT. Joint inputs are `/PSM1/measured_js`,
+`/PSM1/jaw/measured_js`, and equivalent PSM2 topics. Timestamps must share a clock;
+`stereo_sync_slop` defaults to 15 ms and `joint_sync_slop` to 30 ms.
 
-累计变化为 `G = L_current @ inverse(L_reference)`；参考在进入相对模式或切换主臂时建立。副臂保留自身六维误差状态。
+To start dVRK capture and tracking together, use `live_dvrk.launch.py` with
+`handeye`, `dekr_model_path`, and optional `socket_path`. Its image topic arguments
+are named `left_topic` and `right_topic`.
 
-- 旧 `FPRT/tracking/`、`APRT/tracking/` 已由根目录 `tracking/` 取代。
-- 方法配置在 `FPRT/config.py`、`APRT/config.py`；共享数值常量在 `tracking/tracker_config.py`。
-- 原结果元组改为 ArmFrame，外部调用脚本需要按上述字段取值。
-- NPZ 的 `frames`、`ema_states`、`fk_tips` 字段保持不变；`ema_states` 存的是 PF 状态，沿用旧名以兼容读取脚本。
-- 当前 FPRT 也有可靠度门控，与论文中始终处于相对模式的配置有区别。此次为架构重构，未重新评估完整实验精度。
+For offline ROS publishing:
 
-建议阅读顺序：`frame.py` → `offline_session.py` → `arm_tracker.py` → `primary_selector.py` → `combined_tracker.py` → 两类 observation 模块。
+```bash
+ros2 run surgical_tool_tracking_ros2 aprt_offline_node --ros-args \
+  -p data:=/path/to/dataset -p handeye:=/path/to/handeye.yaml \
+  -p out_dir:=/path/to/results -p no_display:=true
+```
+
+Use `fprt_offline_node` for FPRT. ROS outputs are `/tracking/psm1/pose`,
+`/tracking/psm2/pose`, and `/tracking/visualization`.
+
+## Stereo and output conventions
+
+- Entry points resize raw stereo images to 640 x 480.   Keypoints remain in raw-image coordinates;
+  their projection model includes lens distortion.
+- The supplied calibration requires `swap_cameras=True`: left uses K2/D2 and
+  right uses K1/D1. YAML translation is converted from millimetres to metres.
+- Each arm has independent left/right edge-detection histories. Both cameras
+  constrain the same PF; saved videos show only the left image. Tracking, ROS poses, and visualization
+  use the raw left camera frame.
+- Offline output defaults to `./METHOD/tracking_output_offline/` (ROS:
+  `tracking_output_offline_ros2/`). It contains a 30 FPS MP4 and frame PNGs.
+  Choose separate `out_dir` paths to avoid overwriting previous runs.
