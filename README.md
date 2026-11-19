@@ -126,36 +126,6 @@ files `shaft_params_psm1.json` and `shaft_params_psm2.json` override defaults in
 
 ## ROS running
 
-With existing raw stereo image publishers:
-
-```bash
-export DEKR_LIVE_MODEL_PATH=/path/to/model_ident.pt
-ros2 launch surgical_tool_tracking_ros2 tracking.launch.py \
-  handeye:=/path/to/handeye.yaml \
-  image_topic:=/camera/left/image_raw \
-  right_image_topic:=/camera/right/image_raw \
-  allow_primary_switch:=false
-```
-
-Set `allow_primary_switch:=true` for APRT. Launch defaults are 300 particles and
-50 warmup frames. Both launch files default to ELSED; use
-`shaft_backend:=canny_hough` to switch. Direct nodes accept
-`-p shaft_backend:=canny_hough`. For additional parameters, including headless operation:
-
-```bash
-ros2 run surgical_tool_tracking_ros2 aprt_tracking_node --ros-args \
-  -p handeye:=/path/to/handeye.yaml -p dekr_model_path:=/path/to/model_ident.pt \
-  -p warmup_frames:=50 -p no_display:=true
-```
-
-Use `fprt_tracking_node` for FPRT. Joint inputs are `/PSM1/measured_js`,
-`/PSM1/jaw/measured_js`, and equivalent PSM2 topics. Timestamps must share a clock;
-`stereo_sync_slop` defaults to 15 ms and `joint_sync_slop` to 30 ms.
-
-To start dVRK capture and tracking together, use `live_dvrk.launch.py` with
-`handeye`, `dekr_model_path`, and optional `socket_path`. Its image topic arguments
-are named `left_topic` and `right_topic`.
-
 For offline ROS publishing:
 
 ```bash
